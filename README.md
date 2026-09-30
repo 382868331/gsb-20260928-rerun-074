@@ -16,6 +16,30 @@ Cluster.find_placement 校验内存与并发槽，容量不足返回 None，绝�
 容量。需求超过任何单机空容量的实验在提交时抛出 CapacityInfeasibleError，
 不会进入队列。
 
+## 同一实验的多阶段资源需求与可中断等待
+
+1. ExperimentRequest 支持 `stages=(Stage(mem, dur, safe_point), ...)`；不传时
+   旧的 memory/duration 单阶段接口完全兼容，自动视为一个安全点阶段。
+2. 每个阶段只在自己运行时占用资源；阶段结束走与失败/取消同一条幂等释放路径，
+   下一阶段不再需要的容量立即归还集群，不会“占着无用容量”阻塞其他实验。
+3. 下一阶段容量不足时，记录进入明确的 RunStatus.WAITING，`node_id` 置空、
+   占用归零并按 `stage_index` 重新入队；容量满足后从中断的阶段接续。
+4. `Stage.safe_point` 声明该阶段结束边界是否安全点：高优先级（priority>0）
+   任务容量不足时只能请求在跑的低优先级任务在其声明安全点让出，非安全边界
+   绝不抢占；被让出任务在安全点释放并进入 WAITING，已完成阶段不会重算。
+5. 非安全边界处若下一阶段在同节点放得下则直接接续（不被抢占），放不下才
+   释放并显式等待。
+6. 快照保存 `stage_index`、阶段开始时刻与未决让出标记；恢复后从当前阶段
+   继续，事件流水保证每个 `stage_started` 只出现一次。
+
+示例：
+
+    ExperimentRequest(
+        "exp", 90, 10,
+        stages=(Stage(90, 4, safe_point=True), Stage(20, 3, safe_point=False)),
+        priority=0,
+    )
+
 ## 公平策略：老化提权 + 饥饿预留
 
 1. experiment_id 是实验的稳定身份，队列策略只改变服务顺序。
@@ -42,4 +66,5 @@ Scheduler.save_state(path) 保存时钟、节点、需求、运行记录（含�
 
 ## 运行
     .venv/bin/python examples/demo.py
+    .venv/bin/python examples/multistage_demo.py
     .venv/bin/python -m pytest -q

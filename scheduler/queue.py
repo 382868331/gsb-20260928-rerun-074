@@ -23,6 +23,8 @@ class QueueEntry:
     memory_mb: int
     submit_time: int
     duration: int = 1
+    priority: int = 0
+    stage_index: int = 0
 
     def priority_score(self, now: int, starvation_threshold: int) -> int:
         wait = max(0, now - self.submit_time)
@@ -66,28 +68,41 @@ class FairQueuePolicy:
         return sorted(
             self.pending,
             key=lambda e: (
+                -e.priority,
                 e.priority_score(now, self.starvation_threshold),
                 e.submit_time,
                 e.experiment_id,
             ),
         )
 
-    def plan_targets(self, now: int, cluster, release_events: dict[str, list[tuple[int, int]]] | None = None) -> dict[str, Target]:
-        """release_events[node_id] = [(结束时刻, 内存), ...]，来自模拟器在跑任务。"""
-        release_events = release_events or {}
-        """前瞻模拟：按服务顺序为每个排队任务确定最早启动节点。
+    def plan_targets(self, now: int, cluster, release_events: dict[str, list[tuple]] | None = None) -> dict[str, Target]:
+        """release_events[node_id] = [(释放时刻, 内存[, 是否安全点让出]), ...]。
 
-        对每个节点维护假设的在跑/已规划任务结束事件；依次把排队任务放入
-        最早可行的节点，容量不足时快进到任务释放时刻。饥饿任务目标确定后
-        即占用规划容量，后续任务不能抢走。
+        同时包含正常阶段结束与在声明安全点让出的释放：若某个在跑任务同时
+        给出普通结束与更早的让出释放，前瞻取更早者，保证高优让出容量能被
+        等待任务看见；同一实验重复出现时合并，不重复计算释放内存。
         """
+        raw = release_events or {}
+        release_events = {}
+        for node_id, evs in raw.items():
+            by_eid: dict[str, tuple[int, int]] = {}
+            inline: list[tuple[int, int]] = []
+            for ev in evs:
+                if len(ev) == 3:
+                    t, mem, eid = ev
+                    if eid in by_eid:
+                        old_t, old_mem = by_eid[eid]
+                        by_eid[eid] = (min(old_t, t), max(old_mem, mem))
+                    else:
+                        by_eid[eid] = (t, mem)
+                else:
+                    t, mem = ev
+                    inline.append((t, mem))
+            release_events[node_id] = inline + [(t, mem) for t, mem in by_eid.values()]
         states: dict[str, dict] = {}
         for node_id, runtime in cluster.runtime.items():
             if not runtime.available:
                 continue
-            # 每个任务仅需知道结束时刻；当前在跑任务结束时刻模拟器会推送，
-            # 这里用保守假设：它们在未来各自释放，无法知道具体时刻时按
-            # "立刻可被任何释放顺序满足"处理，由实际调度保证不超卖。
             states[node_id] = {
                 "capacity": runtime.node.memory_mb,
                 "slots": runtime.node.max_jobs,

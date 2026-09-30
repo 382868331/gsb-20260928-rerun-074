@@ -10,6 +10,7 @@ from typing import Optional
 class RunStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    WAITING = "waiting"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -17,6 +18,25 @@ class RunStatus(str, Enum):
     @property
     def terminal(self) -> bool:
         return self in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED)
+
+
+@dataclass(frozen=True)
+class Stage:
+    """实验的一个执行阶段：占用 memory_mb，持续 duration 个时间单位。
+
+    safe_point=True 表示本阶段结束边界是声明的安全点，高优先级任务只能在
+    这些边界要求让出资源；False 表示该边界不可被打断接续。
+    """
+
+    memory_mb: int
+    duration: int
+    safe_point: bool = True
+
+    def __post_init__(self) -> None:
+        if self.memory_mb <= 0:
+            raise ValueError("阶段内存必须为正数")
+        if self.duration <= 0:
+            raise ValueError("阶段时长必须为正数")
 
 
 @dataclass(frozen=True)
@@ -43,14 +63,31 @@ class ExperimentRequest:
     duration: int
     submit_time: int = 0
     name: str = ""
+    stages: Optional[tuple[Stage, ...]] = None
+    priority: int = 0
 
     def __post_init__(self) -> None:
-        if self.memory_mb <= 0:
+        if self.stages is not None:
+            if not self.stages:
+                raise ValueError(f"实验 {self.experiment_id} 至少需要一个阶段")
+            for stage in self.stages:
+                if not isinstance(stage, Stage):
+                    raise TypeError("stages 必须是 Stage 列表")
+        elif self.memory_mb <= 0:
             raise ValueError(f"实验 {self.experiment_id} 内存必须为正数")
-        if self.duration <= 0:
+        if self.stages is None and self.duration <= 0:
             raise ValueError(f"实验 {self.experiment_id} 运行时长必须为正数")
         if self.submit_time < 0:
             raise ValueError(f"实验 {self.experiment_id} 提交时间不能为负")
+        if self.priority < 0:
+            raise ValueError(f"实验 {self.experiment_id} 优先级不能为负")
+
+    @property
+    def stage_list(self) -> tuple[Stage, ...]:
+        """统一阶段视图：单阶段旧接口自动包装为一个安全点阶段。"""
+        if self.stages is not None:
+            return self.stages
+        return (Stage(self.memory_mb, self.duration, safe_point=True),)
 
 
 @dataclass
@@ -77,6 +114,8 @@ class RunRecord:
     submit_time: int = 0
     start_time: Optional[int] = None
     end_time: Optional[int] = None
+    stage_index: int = 0
+    stage_started_at: Optional[int] = None
     events: list[RunEvent] = field(default_factory=list)
 
     def log(self, time: int, kind: str, detail: str = "") -> None:
@@ -96,6 +135,8 @@ class RunRecord:
             "submit_time": self.submit_time,
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "stage_index": self.stage_index,
+            "stage_started_at": self.stage_started_at,
             "events": [e.to_dict() for e in self.events],
         }
 
@@ -108,6 +149,8 @@ class RunRecord:
             submit_time=data["submit_time"],
             start_time=data.get("start_time"),
             end_time=data.get("end_time"),
+            stage_index=data.get("stage_index", 0),
+            stage_started_at=data.get("stage_started_at"),
             events=[RunEvent.from_dict(e) for e in data.get("events", [])],
         )
 

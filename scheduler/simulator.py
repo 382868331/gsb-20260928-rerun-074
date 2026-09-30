@@ -16,6 +16,7 @@ from .models import (
     Outage,
     RunRecord,
     RunStatus,
+    Stage,
 )
 from .queue import FairQueuePolicy, QueueEntry
 
@@ -28,6 +29,8 @@ class CapacityInfeasibleError(RuntimeError):
 class SimulationResult:
     now: int
     started: list[str] = field(default_factory=list)
+    waiting: list[str] = field(default_factory=list)
+    yielded: list[str] = field(default_factory=list)
     completed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     cancelled: list[str] = field(default_factory=list)
@@ -49,6 +52,7 @@ class Scheduler:
         self._counter = itertools.count()
         self._event_for: dict[str, tuple[int, int]] = {}
         self.pending_arrivals: set[str] = set()
+        self._yield_requested: dict[str, str] = {}
 
     # ---- 提交与容量校验 -------------------------------------------------
 
@@ -61,28 +65,38 @@ class Scheduler:
             experiment_id=request.experiment_id,
             submit_time=request.submit_time,
         )
-        record.log(request.submit_time, "submitted", f"{request.memory_mb}MB/{request.duration}t")
+        stages = request.stage_list
+        summary = ",".join(f"{s.memory_mb}MB/{s.duration}t" for s in stages)
+        record.log(request.submit_time, "submitted", summary)
         self.records[request.experiment_id] = record
         if request.submit_time <= self.now:
-            self.queue.add(QueueEntry(
-                experiment_id=request.experiment_id,
-                memory_mb=request.memory_mb,
-                submit_time=request.submit_time,
-                duration=request.duration,
-            ))
+            self._enqueue_request(request, stage_index=0)
         else:
             self._push(request.submit_time, ("arrive", request.experiment_id))
             self.pending_arrivals.add(request.experiment_id)
         return record
 
+    def _enqueue_request(self, request: ExperimentRequest, stage_index: int) -> QueueEntry:
+        stage = request.stage_list[stage_index]
+        entry = QueueEntry(
+                experiment_id=request.experiment_id,
+                memory_mb=stage.memory_mb,
+                submit_time=request.submit_time,
+                duration=stage.duration,
+                priority=request.priority,
+                stage_index=stage_index,
+            )
+        self.queue.add(entry)
+        return entry
+
     def _assert_capacity_feasible(self, request: ExperimentRequest) -> None:
         if not any(
-            n.memory_mb >= request.memory_mb and n.max_jobs >= 1
+            n.max_jobs >= 1 and all(n.memory_mb >= s.memory_mb for s in request.stage_list)
             for n in self.cluster.nodes.values()
         ):
             raise CapacityInfeasibleError(
-                f"实验 {request.experiment_id} 需要 {request.memory_mb}MB，"
-                "超过任何节点的单机容量，不会排产不存在的容量"
+                f"实验 {request.experiment_id} 存在超过任何节点单机容量的阶段，"
+                "不会排产不存在的容量"
             )
 
     # ---- 主循环 ---------------------------------------------------------
@@ -122,15 +136,15 @@ class Scheduler:
         for kind, eid in due:
             if kind == "arrive":
                 req = self.requests[eid]
-                self.queue.add(QueueEntry(eid, req.memory_mb, req.submit_time, req.duration))
+                self._enqueue_request(req, stage_index=0)
                 self.pending_arrivals.discard(eid)
                 continue
             if kind == "outage_on":
                 self._apply_outage(eid, available=False, result=result)
             elif kind == "outage_off":
                 self._apply_outage(eid, available=True, result=result)
-            elif kind == "complete":
-                self._finish(eid, RunStatus.COMPLETED, result)
+            elif kind == "stage_end":
+                self._handle_stage_end(eid, result)
             elif kind == "fail":
                 self._finish(eid, RunStatus.FAILED, result)
             elif kind == "cancel":
@@ -139,53 +153,214 @@ class Scheduler:
     # ---- 调度放置 -------------------------------------------------------
 
     def _schedule_pending(self, result: SimulationResult) -> None:
+        self._prune_stale_yield_requests()
         release_events = self._collect_release_events()
         targets = self.queue.plan_targets(self.now, self.cluster, release_events)
+        blocked: list[QueueEntry] = []
         for entry in self.queue.ordered(self.now):
             eid = entry.experiment_id
             target = targets.get(eid)
             if target is None or target.start_time > self.now:
+                blocked.append(entry)
                 continue
             runtime = self.cluster.runtime_for(target.node_id)
             node_id = target.node_id if runtime.can_fit(entry.memory_mb) else None
             if node_id is None:
+                blocked.append(entry)
                 continue
-            self._start(eid, node_id, result)
+            self._start_stage(eid, node_id, entry.stage_index, result)
+        self._request_safe_point_yields(blocked, release_events, result)
 
-    def _collect_release_events(self) -> dict[str, list[tuple[int, int]]]:
-        events: dict[str, list[tuple[int, int]]] = {}
+    def _prune_stale_yield_requests(self) -> None:
+        """让出请求必须仍有对应的高优排队任务才成立。
+
+        请求者完成、取消或自身已启动后，被让出的低优任务不再需要在安全点
+        额外脱离调度；若其安全点本可在同节点接续下一阶段，就直接接续。
+        """
+        if not self._yield_requested:
+            return
+        active_blocked_ids: set[str] = {
+            e.experiment_id for e in self.queue.ordered(self.now) if e.priority > 0
+        }
+        for victim, requester in list(self._yield_requested.items()):
+            if requester not in active_blocked_ids:
+                del self._yield_requested[victim]
+
+    def _request_safe_point_yields(
+        self,
+        blocked: list[QueueEntry],
+        release_events: dict[str, list[tuple]],
+        result: SimulationResult,
+    ) -> None:
+        """容量不足的高优先级任务可请求在跑任务在声明安全点让出。
+
+        只允许在安全点接续：这里只登记让出请求，真正的释放发生在被让出
+        任务的某个 safe_point 阶段结束时刻；非安全边界绝不抢占。
+        """
+        for entry in blocked:
+            if entry.priority <= 0 or entry.experiment_id in result.started:
+                continue
+            candidates = self._yield_candidates_for(entry)
+            if not candidates:
+                continue
+            # 按节点贪心：只要某节点累计释放量能放下该阶段，就在该节点登记让出
+            by_node: dict[str, list[tuple[int, int, str]]] = {}
+            for node_id, mem, safepoint, victim in candidates:
+                by_node.setdefault(node_id, []).append((mem, safepoint, victim))
+            for node_id, offers in by_node.items():
+                offers.sort(key=lambda o: (o[1], o[2]))
+                runtime = self.cluster.runtime_for(node_id)
+                total = 0
+                picks: list[str] = []
+                for mem, sp, victim in offers:
+                    total += mem
+                    picks.append(victim)
+                    if (
+                        total + runtime.free_memory() >= entry.memory_mb
+                        and len(picks) + runtime.free_slots() >= 1
+                    ):
+                        break
+                if (
+                    total + runtime.free_memory() >= entry.memory_mb
+                    and len(picks) + runtime.free_slots() >= 1
+                ):
+                    for victim in picks:
+                        if victim not in self._yield_requested:
+                            self._yield_requested[victim] = entry.experiment_id
+                            result.yielded.append(victim)
+                            rec = self.records[victim]
+                            rec.log(self.now, "yield_requested", f"for={entry.experiment_id}")
+                    return
+
+    def _yield_candidates_for(self, entry: QueueEntry) -> list[tuple[str, int, int, str]]:
+        """返回 (节点, 该任务当前阶段内存, 下一安全点时刻, 实验ID)。
+
+        只有优先级严格低于排队任务、且未来存在声明安全点的在跑任务才可让出。
+        """
+        candidates: list[tuple[str, int, int, str]] = []
+        for eid, record in self.records.items():
+            if record.status is not RunStatus.RUNNING or record.node_id is None:
+                continue
+            req = self.requests[eid]
+            if req.priority >= entry.priority:
+                continue
+            sp = self._next_safe_point(eid)
+            if sp is None:
+                continue
+            stage = req.stage_list[record.stage_index]
+            candidates.append((record.node_id, stage.memory_mb, sp, eid))
+        return candidates
+
+    def _next_safe_point(self, eid: str) -> Optional[int]:
+        """在跑任务下一个 safe_point 阶段边界时刻；没有则 None（不可打断）。"""
+        record = self.records[eid]
+        req = self.requests[eid]
+        assert record.stage_started_at is not None
+        t = record.stage_started_at
+        for idx in range(record.stage_index, len(req.stage_list)):
+            t += req.stage_list[idx].duration
+            if req.stage_list[idx].safe_point:
+                return t
+        return None
+
+    def _collect_release_events(self) -> dict[str, list[tuple]]:
+        events: dict[str, list[tuple]] = {}
         for fire_time, _, (kind, eid) in self._heap:
-            if kind not in ("complete", "fail"):
+            if kind not in ("stage_end", "fail"):
                 continue
             record = self.records.get(eid)
             if record is None or record.status is not RunStatus.RUNNING or record.node_id is None:
                 continue
-            mem = self.requests[eid].memory_mb
-            events.setdefault(record.node_id, []).append((fire_time, mem))
+            mem = self.requests[eid].stage_list[record.stage_index].memory_mb
+            events.setdefault(record.node_id, []).append((fire_time, mem, eid))
+        # 已被请求让出的任务，其下一安全点也是确定的未来释放事件
+        for eid in list(self._yield_requested):
+            record = self.records.get(eid)
+            if record is None or record.status is not RunStatus.RUNNING or record.node_id is None:
+                del self._yield_requested[eid]
+                continue
+            sp = self._next_safe_point(eid)
+            if sp is None:
+                continue
+            mem = self.requests[eid].stage_list[record.stage_index].memory_mb
+            events.setdefault(record.node_id, []).append((sp, mem, eid))
         return events
 
-    def _start(self, eid: str, node_id: str, result: SimulationResult) -> None:
+    def _start_stage(self, eid: str, node_id: str, stage_index: int, result: SimulationResult) -> None:
         req = self.requests[eid]
         record = self.records[eid]
-        self.cluster.runtime_for(node_id).allocate(eid, req.memory_mb)
+        stage = req.stage_list[stage_index]
+        self.cluster.runtime_for(node_id).allocate(eid, stage.memory_mb)
         record.status = RunStatus.RUNNING
         record.node_id = node_id
-        record.start_time = self.now
-        record.log(self.now, "started", f"node={node_id}")
+        record.stage_index = stage_index
+        record.stage_started_at = self.now
+        if record.start_time is None:
+            record.start_time = self.now
+        record.log(self.now, "stage_started", f"stage={stage_index} node={node_id} mem={stage.memory_mb}")
         self.queue.remove(eid)
-        end_time = self.now + req.duration
-        self._push(end_time, ("complete", eid), key=eid)
+        self._yield_requested.pop(eid, None)
+        end_time = self.now + stage.duration
+        self._push(end_time, ("stage_end", eid), key=eid)
         result.started.append(eid)
+
+    def _handle_stage_end(self, eid: str, result: SimulationResult) -> None:
+        """阶段结束：释放本阶段不再需要的资源，再决定完成/接续/显式等待。
+
+        - 已是最后一个阶段：实验完成。
+        - 声明了安全点且被高优先级任务请求让出：释放后回到队列显式等待。
+        - 非安全边界：下一阶段在同节点立刻放得下则直接接续（绝不被抢占），
+          放不下才释放并显式等待（不会占着无用容量阻塞其他实验）。
+        - 普通安全边界：释放后重新排队，由公平策略统一调度下一阶段。
+        """
+        record = self.records.get(eid)
+        if record is None or record.status is not RunStatus.RUNNING:
+            return
+        req = self.requests[eid]
+        finished_stage = record.stage_index
+        runtime = self.cluster.runtime_for(record.node_id)
+        released = runtime.release(eid)  # 幂等：只释放一次
+        assert released
+        self._event_for.pop(eid, None)
+        record.log(self.now, "stage_completed", f"stage={finished_stage} node={record.node_id}")
+        next_index = finished_stage + 1
+        if next_index >= len(req.stage_list):
+            record.status = RunStatus.COMPLETED
+            record.end_time = self.now
+            record.stage_started_at = None
+            self._yield_requested.pop(eid, None)
+            record.log(self.now, "completed", f"node={record.node_id}")
+            result.completed.append(eid)
+            return
+        stage = req.stage_list[finished_stage]
+        must_yield = stage.safe_point and eid in self._yield_requested
+        if must_yield:
+            self._yield_requested.pop(eid, None)
+            record.log(self.now, "yielded", f"at_stage={finished_stage}")
+        if not stage.safe_point and not must_yield:
+            next_stage = req.stage_list[next_index]
+            if runtime.can_fit(next_stage.memory_mb):
+                self._start_stage(eid, record.node_id, next_index, result)
+                return
+        # 释放后进入明确等待：不保留任何节点容量
+        record.status = RunStatus.WAITING
+        record.node_id = None
+        record.stage_index = next_index
+        record.stage_started_at = None
+        self._enqueue_request(req, stage_index=next_index)
+        record.log(self.now, "waiting", f"stage={next_index}")
+        result.waiting.append(eid)
 
     def _finish(self, eid: str, status: RunStatus, result: SimulationResult) -> None:
         record = self.records.get(eid)
         if record is None or record.status is not RunStatus.RUNNING:
             return
         runtime = self.cluster.runtime_for(record.node_id)
-        released = runtime.release(eid)  # 幂等：只释放一次
+        released = runtime.release(eid)
         assert released
         record.status = status
         record.end_time = self.now
+        record.stage_started_at = None
         record.log(self.now, status.value, f"node={record.node_id}")
         self._event_for.pop(eid, None)
         (result.completed if status is RunStatus.COMPLETED else result.failed).append(eid)
@@ -201,6 +376,8 @@ class Scheduler:
             self.queue.remove(eid)
         record.status = RunStatus.CANCELLED
         record.end_time = self.now
+        record.stage_started_at = None
+        self._yield_requested.pop(eid, None)
         record.log(self.now, "cancelled")
         self._event_for.pop(eid, None)
         result.cancelled.append(eid)
@@ -225,6 +402,8 @@ class Scheduler:
             runtime.release(eid)
             record.status = RunStatus.FAILED
             record.end_time = self.now
+            record.stage_started_at = None
+            self._yield_requested.pop(eid, None)
             record.log(self.now, "failed", f"node {node_id} unavailable")
             result.failed.append(eid)
 
@@ -266,6 +445,15 @@ class Scheduler:
                     "duration": r.duration,
                     "submit_time": r.submit_time,
                     "name": r.name,
+                    "priority": r.priority,
+                    "stages": (
+                        None
+                        if r.stages is None
+                        else [
+                            {"memory_mb": s.memory_mb, "duration": s.duration, "safe_point": s.safe_point}
+                            for s in r.stages
+                        ]
+                    ),
                 }
                 for r in self.requests.values()
             ],
@@ -276,6 +464,10 @@ class Scheduler:
             ],
             "counter": max((s for _, s, _ in self._heap), default=-1),
             "pending_arrivals": sorted(self.pending_arrivals),
+            "yield_requested": [
+                {"victim": victim, "requester": requester}
+                for victim, requester in sorted(self._yield_requested.items())
+            ],
             "event_for": {k: list(v) for k, v in self._event_for.items()},
         }
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -286,23 +478,32 @@ class Scheduler:
         nodes = [Node(**n) for n in data["nodes"]]
         scheduler = cls(nodes, starvation_threshold=data["starvation_threshold"], now=data["now"])
         for raw in data["requests"]:
+            raw = dict(raw)
+            stages_raw = raw.pop("stages", None)
+            raw["stages"] = (
+                None
+                if stages_raw is None
+                else tuple(Stage(**s) for s in stages_raw)
+            )
             scheduler.requests[raw["experiment_id"]] = ExperimentRequest(**raw)
         for raw in data["records"]:
             record = RunRecord.from_dict(raw)
             scheduler.records[record.experiment_id] = record
             if (
-                record.status is RunStatus.PENDING
+                record.status in (RunStatus.PENDING, RunStatus.WAITING)
                 and record.experiment_id not in data.get("pending_arrivals", [])
             ):
                 req = scheduler.requests[record.experiment_id]
-                scheduler.queue.add(QueueEntry(
-                    record.experiment_id, req.memory_mb, record.submit_time, req.duration
-                ))
+                scheduler._enqueue_request(req, stage_index=record.stage_index)
             elif record.status is RunStatus.RUNNING:
                 req = scheduler.requests[record.experiment_id]
                 rt = scheduler.cluster.runtime_for(record.node_id)
-                rt.allocate(record.experiment_id, req.memory_mb)
+                rt.allocate(record.experiment_id, req.stage_list[record.stage_index].memory_mb)
         scheduler.pending_arrivals = set(data.get("pending_arrivals", []))
+        raw_yield = data.get("yield_requested", [])
+        scheduler._yield_requested = {
+            item["victim"]: item["requester"] for item in raw_yield
+        } if raw_yield and isinstance(raw_yield[0], dict) else {}
         for raw in data["heap"]:
             heapq.heappush(
                 scheduler._heap,
