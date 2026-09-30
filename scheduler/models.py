@@ -9,6 +9,7 @@ from typing import Optional
 
 class RunStatus(str, Enum):
     PENDING = "pending"
+    WAITING = "waiting"  # 阶段间资源不足：已释放旧资源，等待下一阶段
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -35,14 +36,61 @@ class Node:
 
 
 @dataclass(frozen=True)
+class StageSpec:
+    """实验的一个阶段：该阶段持续 duration，占用 memory_mb。
+
+    safe_point_offsets 是阶段内（相对阶段起点）允许被高优先任务抢占
+    让出的时刻；阶段结束始终是隐式安全点。空列表表示只能在阶段
+    边界让出。
+    """
+
+    memory_mb: int
+    duration: int
+    safe_point_offsets: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.memory_mb <= 0:
+            raise ValueError("阶段内存必须为正数")
+        if self.duration <= 0:
+            raise ValueError("阶段时长必须为正数")
+        bad = [o for o in self.safe_point_offsets if o <= 0 or o >= self.duration]
+        if bad:
+            raise ValueError(f"安全点必须位于阶段内部 (0, {self.duration})：{bad}")
+
+    def safe_points(self) -> tuple[int, ...]:
+        return tuple(sorted(self.safe_point_offsets)) + (self.duration,)
+
+    def to_dict(self) -> dict:
+        return {
+            "memory_mb": self.memory_mb,
+            "duration": self.duration,
+            "safe_point_offsets": list(self.safe_point_offsets),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StageSpec":
+        return cls(
+            memory_mb=data["memory_mb"],
+            duration=data["duration"],
+            safe_point_offsets=tuple(data.get("safe_point_offsets", [])),
+        )
+
+
+@dataclass(frozen=True)
 class ExperimentRequest:
-    """实验需求。experiment_id 是稳定身份，队列策略调整不改变它。"""
+    """实验需求。experiment_id 是稳定身份，队列策略调整不改变它。
+
+    priority 越大越优先（默认 0）。stages 为空时按 memory_mb/duration
+    构造单阶段任务，兼容旧调用。
+    """
 
     experiment_id: str
     memory_mb: int
     duration: int
     submit_time: int = 0
     name: str = ""
+    priority: int = 0
+    stages: tuple[StageSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if self.memory_mb <= 0:
@@ -51,6 +99,43 @@ class ExperimentRequest:
             raise ValueError(f"实验 {self.experiment_id} 运行时长必须为正数")
         if self.submit_time < 0:
             raise ValueError(f"实验 {self.experiment_id} 提交时间不能为负")
+        stages = self.stages or (StageSpec(self.memory_mb, self.duration),)
+        if self.stages:
+            total = sum(s.duration for s in self.stages)
+            if total != self.duration:
+                raise ValueError(
+                    f"实验 {self.experiment_id} 各阶段时长之和 {total} 与 duration {self.duration} 不一致"
+                )
+        object.__setattr__(self, "stages", stages)
+
+    @property
+    def stage_specs(self) -> tuple[StageSpec, ...]:
+        return self.stages
+
+    def to_dict(self) -> dict:
+        return {
+            "experiment_id": self.experiment_id,
+            "memory_mb": self.memory_mb,
+            "duration": self.duration,
+            "submit_time": self.submit_time,
+            "name": self.name,
+            "priority": self.priority,
+            "stages": [s.to_dict() for s in self.stages],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExperimentRequest":
+        raw_stages = data.get("stages")
+        stages = tuple(StageSpec.from_dict(s) for s in raw_stages) if raw_stages else ()
+        return cls(
+            experiment_id=data["experiment_id"],
+            memory_mb=data["memory_mb"],
+            duration=data["duration"],
+            submit_time=data.get("submit_time", 0),
+            name=data.get("name", ""),
+            priority=data.get("priority", 0),
+            stages=stages,
+        )
 
 
 @dataclass
@@ -78,6 +163,9 @@ class RunRecord:
     start_time: Optional[int] = None
     end_time: Optional[int] = None
     events: list[RunEvent] = field(default_factory=list)
+    current_stage: int = 0       # 待执行/正在执行的阶段下标（已完成阶段数）
+    stage_elapsed: int = 0       # 当前阶段已执行的时间单位（在安全点让出时保留）
+    stage_started_at: Optional[int] = None
 
     def log(self, time: int, kind: str, detail: str = "") -> None:
         self.events.append(RunEvent(time, kind, detail))
@@ -96,6 +184,9 @@ class RunRecord:
             "submit_time": self.submit_time,
             "start_time": self.start_time,
             "end_time": self.end_time,
+            "current_stage": self.current_stage,
+            "stage_elapsed": self.stage_elapsed,
+            "stage_started_at": self.stage_started_at,
             "events": [e.to_dict() for e in self.events],
         }
 
@@ -108,6 +199,9 @@ class RunRecord:
             submit_time=data["submit_time"],
             start_time=data.get("start_time"),
             end_time=data.get("end_time"),
+            current_stage=data.get("current_stage", 0),
+            stage_elapsed=data.get("stage_elapsed", 0),
+            stage_started_at=data.get("stage_started_at"),
             events=[RunEvent.from_dict(e) for e in data.get("events", [])],
         )
 

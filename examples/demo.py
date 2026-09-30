@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import tempfile
 
-from scheduler import ExperimentRequest, Node, Scheduler
+from scheduler import ExperimentRequest, Node, Scheduler, StageSpec
 from scheduler.models import Outage
 
 
@@ -41,6 +41,24 @@ def main() -> None:
         f"终态={big.status.value}，节点={big.node_id}"
     )
     assert 0 < (big.wait_time or 0) <= 10
+
+    # ---- 多阶段 + 安全点抢占 + 节点退出 ----
+    s2 = Scheduler([Node("a", 100, 1), Node("b", 100, 1)])
+    s2.submit(ExperimentRequest(
+        "pipeline", 40, 4,
+        stages=(StageSpec(40, 2), StageSpec(100, 2))))
+    s2.submit(ExperimentRequest("blocker", 60, 4))
+    s2.submit(ExperimentRequest(
+        "urgent", 100, 1, submit_time=1, priority=10,
+        stages=(StageSpec(100, 1, safe_point_offsets=()),)))
+    s2.remove_node("a", 20)
+    s2.run_until()
+    p = s2.records["pipeline"]
+    print(
+        f"pipeline 终态={p.status.value}，结束={p.end_time}，"
+        f"事件={'/'.join(e.kind for e in p.events)}"
+    )
+    assert p.status.value == "completed"
 
 
 if __name__ == "__main__":

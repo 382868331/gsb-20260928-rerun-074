@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+HORIZON = 10 ** 9
+
 
 @dataclass
 class QueueEntry:
@@ -23,11 +25,13 @@ class QueueEntry:
     memory_mb: int
     submit_time: int
     duration: int = 1
+    priority: int = 0
+    stage: int = 0
 
-    def priority_score(self, now: int, starvation_threshold: int) -> int:
+    def priority_score(self, now: int, starvation_threshold: int) -> tuple[int, int]:
         wait = max(0, now - self.submit_time)
         age_credit = max(0, wait - starvation_threshold)
-        return self.submit_time - age_credit
+        return -self.priority, self.submit_time - age_credit
 
     def is_starved(self, now: int, starvation_threshold: int) -> bool:
         return now - self.submit_time >= starvation_threshold
@@ -65,11 +69,8 @@ class FairQueuePolicy:
     def ordered(self, now: int) -> list[QueueEntry]:
         return sorted(
             self.pending,
-            key=lambda e: (
-                e.priority_score(now, self.starvation_threshold),
-                e.submit_time,
-                e.experiment_id,
-            ),
+            key=lambda e: (*e.priority_score(now, self.starvation_threshold),
+                           e.submit_time, e.experiment_id),
         )
 
     def plan_targets(self, now: int, cluster, release_events: dict[str, list[tuple[int, int]]] | None = None) -> dict[str, Target]:
@@ -85,14 +86,15 @@ class FairQueuePolicy:
         for node_id, runtime in cluster.runtime.items():
             if not runtime.available:
                 continue
-            # 每个任务仅需知道结束时刻；当前在跑任务结束时刻模拟器会推送，
-            # 这里用保守假设：它们在未来各自释放，无法知道具体时刻时按
-            # "立刻可被任何释放顺序满足"处理，由实际调度保证不超卖。
+            # 当前真实占用计入账目；已登记结束事件的在跑任务用释放事件
+            # 表示其占用会在对应时刻归还。未提供结束事件的占用保守地
+            # 视为永不释放，绝不超卖规划。
+            known = [m for t, m in release_events.get(node_id, []) if t > now]
             states[node_id] = {
                 "capacity": runtime.node.memory_mb,
                 "slots": runtime.node.max_jobs,
-                "used_mem": 0,
-                "used_slots": 0,
+                "used_mem": runtime.used_memory - sum(known),
+                "used_slots": len(runtime.running) - len(known),
                 "events": [(t, m, 1) for t, m in release_events.get(node_id, [])],
             }
 
@@ -108,31 +110,33 @@ class FairQueuePolicy:
             node_id, start = choice
             starved = entry.is_starved(now, self.starvation_threshold)
             targets[entry.experiment_id] = Target(entry.experiment_id, node_id, start, starved)
-            # 饥饿任务立即硬预留；非饥饿任务同样登记规划，避免互相抢占错配
+            # 饥饿任务从 now 起硬预留目标容量（释放时刻设为无穷远），
+            # 持续到来的小任务无法占用；非饥饿任务登记真实结束时刻。
             self._earliest_start(entry.memory_mb, now, states[node_id], commit=True,
-                                 duration=entry.duration, forced_time=start)
+                                 duration=HORIZON if starved else entry.duration,
+                                 forced_time=now if starved else start)
         return targets
 
     @staticmethod
     def _earliest_start(memory_mb, now, state, commit, duration=None, forced_time=None):
         events = sorted(state["events"])
-        total_mem = state["used_mem"] + sum(m for _, m, _ in events)
-        total_slots = state["used_slots"] + len(events)
-        free_mem = state["capacity"] - total_mem
-        free_slots = state["slots"] - total_slots
         t = now
         idx = 0
-        while free_mem < memory_mb or free_slots < 1:
-            future = [e for e in events if e[0] > t]
-            if not future:
+        def occupied(at):
+            outstanding = [(m, s) for et, m, s in events if et > at]
+            mem = state["used_mem"] + sum(m for m, _ in outstanding)
+            slots = state["used_slots"] + len(outstanding)
+            return mem, slots
+        used_mem, used_slots = occupied(t)
+        while used_mem + memory_mb > state["capacity"] or used_slots + 1 > state["slots"]:
+            upcoming = events[idx] if idx < len(events) else None
+            if upcoming is None:
                 return None
-            t = future[0][0]
-            while idx < len(events) and events[idx][0] <= t:
-                _, mem, slot = events[idx]
-                free_mem += mem
-                free_slots += slot
-                idx += 1
+            t = upcoming[0]
+            idx += 1
+            used_mem, used_slots = occupied(t)
         start = forced_time if forced_time is not None else t
         if commit:
             state["events"].append((start + duration, memory_mb, 1))
+            state["events"].sort()
         return start

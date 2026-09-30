@@ -34,11 +34,37 @@ add_outage(node_id, Outage(start, end))：
 - 排队任务的前瞻规划自动绕开不可用节点；
 - 区间结束后节点恢复，继续参与放置。
 
+## 多阶段资源需求与可中断等待
+
+`ExperimentRequest(stages=(StageSpec(mem, dur, safe_point_offsets=...), ...))`
+描述同一实验按顺序执行的多个阶段：
+
+- 阶段结束即释放该阶段的内存与槽位；下一阶段若当前放不下，任务进入
+  `WAITING`（明确等待），不保留任何旧阶段占用，因此不会占着无用容量
+  阻塞其他实验。容量归还后在同一 tick 重新放置。
+- `RunRecord.current_stage` 是已完成阶段数，`stage_elapsed` 是当前阶段
+  已执行单位；快照保存/恢复这两项，已执行的阶段和时间不会再算一次。
+
+## 高优先抢占：仅在声明的安全点接续
+
+`priority` 越大越优先。高优先任务当前无法放置时，调度器只挑选优先级更
+低的在跑任务，在它们 `StageSpec.safe_point_offsets` 声明的阶段内安全点
+（阶段结束恒为隐式安全点）让出；无安全点时必须等到阶段边界。
+
+- 受害者在安全点释放资源并转为 `WAITING`，保留 `stage_elapsed`，高优先
+  任务完成后只跑剩余时间。
+- 同优先级或更高优先级任务不会被抢占；抢占请求只登记最近的安全点。
+
+`Scheduler.remove_node(node_id, at_time)` 安排节点永久退出：时刻到达后
+该节点不再接受放置，在跑任务失败并释放账目，排队任务由前瞻规划绕行到
+其他节点。
+
 ## 状态保存与接续模拟
 
-Scheduler.save_state(path) 保存时钟、节点、需求、运行记录（含完整事件
-流水）与未来事件堆；Scheduler.load_state(path) 后可直接 run_until 继续
-模拟，实验身份与在跑任务的占用都会恢复。
+Scheduler.save_state(path) 保存时钟、节点、需求（含阶段定义与优先级）、
+运行记录（含阶段进度与完整事件流水）、未来事件堆与失效事件序列号；
+Scheduler.load_state(path) 后可直接 run_until 继续模拟，实验身份、在跑
+占用、WAITING 阶段位置与已登记的安全点让出都会恢复。
 
 ## 运行
     .venv/bin/python examples/demo.py
