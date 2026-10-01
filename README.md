@@ -5,7 +5,10 @@
 
 ## 资源模型
 
-- 节点只有两类资源：内存（MB）与并发槽（max_jobs）。
+- 节点内置内存（MB）与并发槽（max_jobs），还可通过
+  `Node(..., capacities={"gpu": 1, "device": 2})` 声明独占设备等命名资源。
+- 阶段用 `Stage(..., resources={"gpu": 1})` 声明多类资源；内存、槽位和所有
+  命名资源是同一个原子需求，全部满足才启动，不会只拿到一部分就执行。
 - 任务在真正 start 时才占用资源；排队期间不预占。
 - 完成、失败、取消走同一条幂等释放路径，NodeRuntime.release 对同一实验
   重复调用第二次返回 False，保证只释放一次。
@@ -50,19 +53,34 @@ Cluster.find_placement 校验内存与并发槽，容量不足返回 None，绝�
 4. 因此大任务的等待上界约为 starvation_threshold 加已在跑任务的剩余
    时长，不会被小任务无限饿死。tests/test_fairness.py 用随机到达模式验证。
 
-## 节点临时不可用
+## 节点维护与迁移限制
 
 add_outage(node_id, Outage(start, end))：
 
-- 区间开始时该节点不再接受新任务，正在运行的任务失败并释放资源；
-- 排队任务的前瞻规划自动绕开不可用节点；
+- `Stage(migratable=True)`：维护开始时立即释放当前节点的全部资源，带着阶段
+  剩余时长迁移到其他满足完整资源组合的节点；阶段不重算。
+- `Stage(migratable=False)`：维护开始时也释放资源，避免维护等待期间占着容量，
+  但任务钉在原节点，只能在维护结束后用剩余时长续跑，不能迁到其他节点。
+- `safe_point=False` 且未进入维护的阶段不会在边界被高优任务抢占；下一阶段资源
+  不足或节点维护时先释放，再进入显式等待。
+- 排队任务的前瞻规划自动绕开维护节点。
 - 区间结束后节点恢复，继续参与放置。
+
+## 阻塞原因与调度预算
+
+`scheduler.last_blockages` 保存最近一次调度尝试中每个未启动实验的原因：
+
+- `resource_shortage`：当前没有任何节点拥有或能在未来释放完整资源组合；
+- `maintenance`：容量存在，但唯一可行节点处于维护窗口；
+- `budget_limit`：本次 `run_until(..., schedule_budget=n)` 最多只允许新启动 n 个阶段。
 
 ## 状态保存与接续模拟
 
-Scheduler.save_state(path) 保存时钟、节点、需求、运行记录（含完整事件
-流水）与未来事件堆；Scheduler.load_state(path) 后可直接 run_until 继续
-模拟，实验身份与在跑任务的占用都会恢复。
+Scheduler.save_state(path) 保存时钟、节点、命名资源占用、维护窗口、调度预算、
+需求、运行记录（含完整事件流水）、阶段剩余时长与未来事件堆；
+Scheduler.load_state(path) 后可直接 run_until 继续模拟。保存重开后每个
+stage_started 只出现一次，迁移续跑记录为 stage_resumed，资源最终账目与
+不中断运行一致。
 
 ## 运行
     .venv/bin/python examples/demo.py

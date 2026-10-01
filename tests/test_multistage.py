@@ -71,18 +71,20 @@ def test_non_safe_boundary_is_not_preempted():
     assert scheduler.records["low"].status is RunStatus.COMPLETED
 
 
-def test_resource_accounting_after_node_exit_and_recovery():
+def test_non_migratable_stage_releases_for_maintenance_then_resumes():
     scheduler = Scheduler([Node("n1", 100, 2), Node("n2", 100, 2)], starvation_threshold=100)
     scheduler.submit(staged("m", [Stage(90, 8), Stage(90, 2)]))
     scheduler.run_until(end_time=0)
     node = scheduler.records["m"].node_id
     scheduler.add_outage(node, Outage(start=2, end=4))
     scheduler.submit(ExperimentRequest("small", 30, 2, submit_time=1))
-    scheduler.run_until()
-    assert scheduler.records["m"].status is RunStatus.FAILED
+    result = scheduler.run_until()
+    assert scheduler.records["m"].status is RunStatus.COMPLETED
+    assert scheduler.records["m"].end_time == 12
     assert scheduler.cluster.runtime_for(node).used_memory == 0
     assert scheduler.cluster.runtime_for(node).running == {}
     assert scheduler.records["small"].status is RunStatus.COMPLETED
+    assert "m" in result.waiting
 
 
 def test_cancel_during_explicit_wait_releases_nothing_and_keeps_stage_index():

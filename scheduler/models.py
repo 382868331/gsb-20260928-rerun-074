@@ -22,36 +22,57 @@ class RunStatus(str, Enum):
 
 @dataclass(frozen=True)
 class Stage:
-    """实验的一个执行阶段：占用 memory_mb，持续 duration 个时间单位。
+    """实验的一个执行阶段。
 
-    safe_point=True 表示本阶段结束边界是声明的安全点，高优先级任务只能在
-    这些边界要求让出资源；False 表示该边界不可被打断接续。
+    memory_mb 与 resources 会合并成一个原子资源需求，调度时必须一次全部
+    满足，不能只拿到部分资源就启动。
+
+    safe_point=True 表示本阶段结束边界可以让出；migratable=True 表示遇到
+    节点维护时可带剩余进度迁移。二者都为 False 时只能在原节点维护结束后
+    继续，且其他任务不能在阶段边界抢占它。
     """
 
     memory_mb: int
     duration: int
     safe_point: bool = True
+    resources: dict[str, int] = field(default_factory=dict)
+    migratable: bool = False
 
     def __post_init__(self) -> None:
         if self.memory_mb <= 0:
             raise ValueError("阶段内存必须为正数")
         if self.duration <= 0:
             raise ValueError("阶段时长必须为正数")
+        for name, amount in self.resources.items():
+            if amount <= 0:
+                raise ValueError(f"阶段资源 {name} 需求量必须为正数")
+
+    @property
+    def resource_request(self) -> dict[str, int]:
+        return {"memory_mb": self.memory_mb, "slots": 1, **self.resources}
 
 
 @dataclass(frozen=True)
 class Node:
-    """虚拟计算节点：只有内存与并发槽两类资源。"""
+    """虚拟计算节点：内置内存/并发槽，并可声明设备等命名资源容量。"""
 
     node_id: str
     memory_mb: int
     max_jobs: int
+    capacities: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.memory_mb <= 0:
             raise ValueError(f"节点 {self.node_id} 内存必须为正数")
         if self.max_jobs <= 0:
             raise ValueError(f"节点 {self.node_id} 并发上限必须为正数")
+        for name, amount in self.capacities.items():
+            if amount <= 0:
+                raise ValueError(f"节点 {self.node_id} 资源 {name} 容量必须为正数")
+
+    @property
+    def resource_capacity(self) -> dict[str, int]:
+        return {"memory_mb": self.memory_mb, "slots": self.max_jobs, **self.capacities}
 
 
 @dataclass(frozen=True)
@@ -116,6 +137,8 @@ class RunRecord:
     end_time: Optional[int] = None
     stage_index: int = 0
     stage_started_at: Optional[int] = None
+    stage_remaining: Optional[int] = None
+    pinned_node_id: Optional[str] = None
     events: list[RunEvent] = field(default_factory=list)
 
     def log(self, time: int, kind: str, detail: str = "") -> None:
@@ -137,6 +160,8 @@ class RunRecord:
             "end_time": self.end_time,
             "stage_index": self.stage_index,
             "stage_started_at": self.stage_started_at,
+            "stage_remaining": self.stage_remaining,
+            "pinned_node_id": self.pinned_node_id,
             "events": [e.to_dict() for e in self.events],
         }
 
@@ -151,13 +176,15 @@ class RunRecord:
             end_time=data.get("end_time"),
             stage_index=data.get("stage_index", 0),
             stage_started_at=data.get("stage_started_at"),
+            stage_remaining=data.get("stage_remaining"),
+            pinned_node_id=data.get("pinned_node_id"),
             events=[RunEvent.from_dict(e) for e in data.get("events", [])],
         )
 
 
 @dataclass(frozen=True)
 class Outage:
-    """节点临时不可用区间 [start, end)。"""
+    """节点维护区间 [start, end)。"""
 
     start: int
     end: int
@@ -179,9 +206,17 @@ class NodeRuntime:
 
     def __init__(self, node: Node) -> None:
         self.node = node
-        self.used_memory = 0
-        self.running: dict[str, int] = {}
+        self.used: dict[str, int] = {name: 0 for name in node.resource_capacity}
+        self.allocations: dict[str, dict[str, int]] = {}
         self.available = True
+
+    @property
+    def used_memory(self) -> int:
+        return self.used.get("memory_mb", 0)
+
+    @property
+    def running(self) -> dict[str, int]:
+        return {eid: demand.get("memory_mb", 0) for eid, demand in self.allocations.items()}
 
     def free_memory(self) -> int:
         return self.node.memory_mb - self.used_memory
@@ -189,34 +224,65 @@ class NodeRuntime:
     def free_slots(self) -> int:
         return self.node.max_jobs - len(self.running)
 
-    def can_fit(self, memory_mb: int) -> bool:
-        return self.available and memory_mb <= self.free_memory() and self.free_slots() >= 1
+    def free_resource(self, name: str) -> int:
+        return self.node.resource_capacity.get(name, 0) - self.used.get(name, 0)
 
-    def allocate(self, experiment_id: str, memory_mb: int) -> None:
+    def can_fit(self, memory_mb: Optional[int] = None, resources: Optional[dict[str, int]] = None) -> bool:
+        demand = self._demand(memory_mb, resources)
+        return self.available and all(amount <= self.free_resource(name) for name, amount in demand.items())
+
+    @staticmethod
+    def _demand(memory_mb: Optional[int], resources: Optional[dict[str, int]]) -> dict[str, int]:
+        demand = dict(resources or {})
+        if memory_mb is not None:
+            demand["memory_mb"] = memory_mb
+        demand.setdefault("slots", 1)
+        return demand
+
+    def allocate(self, experiment_id: str, memory_mb, resources: Optional[dict[str, int]] = None) -> None:
+        if isinstance(memory_mb, dict):
+            demand = dict(memory_mb)
+        else:
+            demand = self._demand(memory_mb, resources)
         if experiment_id in self.running:
             raise RuntimeError(f"实验 {experiment_id} 已在节点 {self.node.node_id} 占用资源")
-        if not self.can_fit(memory_mb):
+        missing = [name for name in demand if name not in self.node.resource_capacity]
+        if missing:
+            raise RuntimeError(f"节点 {self.node.node_id} 不存在资源 {','.join(sorted(missing))}")
+        if not self.can_fit(resources=demand):
             raise RuntimeError(
-                f"节点 {self.node.node_id} 无法容纳 {memory_mb}MB："
-                f"剩余内存 {self.free_memory()}，剩余并发槽 {self.free_slots()}"
+                f"节点 {self.node.node_id} 无法容纳 {demand}：剩余 {self.free_resources()}"
             )
-        self.used_memory += memory_mb
-        self.running[experiment_id] = memory_mb
+        for name, amount in demand.items():
+            self.used[name] = self.used.get(name, 0) + amount
+        self.allocations[experiment_id] = demand
 
     def release(self, experiment_id: str) -> bool:
         """释放资源；返回是否真正执行释放（保证只释放一次）。"""
-        memory = self.running.pop(experiment_id, None)
-        if memory is None:
+        demand = self.allocations.pop(experiment_id, None)
+        if demand is None:
             return False
-        self.used_memory -= memory
+        for name, amount in demand.items():
+            self.used[name] -= amount
         return True
+
+    def free_resources(self) -> dict[str, int]:
+        return {name: self.free_resource(name) for name in self.node.resource_capacity}
 
     def to_dict(self) -> dict:
         return {
             "used_memory": self.used_memory,
-            "running": dict(self.running),
+            "used": dict(self.used),
+            "running": dict(self.allocations),
             "available": self.available,
         }
+
+    def load_dict(self, data: dict) -> None:
+        self.available = data.get("available", True)
+        self.used = {name: 0 for name in self.node.resource_capacity}
+        self.allocations = {}
+        for eid, demand in data.get("running", {}).items():
+            self.allocate(eid, demand)
 
 
 class Cluster:
@@ -240,6 +306,7 @@ class Cluster:
         exclude: Optional[set[str]] = None,
         reserved_memory: Optional[dict[str, int]] = None,
         reserved_slots: Optional[dict[str, int]] = None,
+        resources: Optional[dict[str, int]] = None,
     ) -> Optional[str]:
         """返回可放置节点 ID；不可行时返回 None，绝不安排超卖容量。
 
@@ -257,7 +324,12 @@ class Cluster:
             held_slots = reserved_slots.get(node_id, 0)
             usable_memory = runtime.node.memory_mb - runtime.used_memory - held_mem
             usable_slots = runtime.node.max_jobs - len(runtime.running) - held_slots
-            if memory_mb <= usable_memory and usable_slots >= 1:
+            named_demand = resources or {}
+            named_ok = all(
+                runtime.node.capacities.get(name, 0) - runtime.used.get(name, 0) >= amount
+                for name, amount in named_demand.items()
+            )
+            if memory_mb <= usable_memory and usable_slots >= 1 and named_ok:
                 candidates.append((usable_memory, usable_slots, node_id))
         if not candidates:
             return None

@@ -101,7 +101,7 @@ def test_big_job_not_starved_by_small_jobs():
     assert big.wait_time <= 7
 
 
-def test_node_outage_moves_work_and_fails_running():
+def test_non_migratable_work_waits_until_node_maintenance_ends():
     scheduler = Scheduler([
         Node("n1", 100, 2),
         Node("n2", 100, 2),
@@ -111,10 +111,12 @@ def test_node_outage_moves_work_and_fails_running():
     scheduler.run_until(end_time=0)
     node_a = scheduler.records["a"].node_id
     scheduler.add_outage(node_a, Outage(start=2, end=5))
-    scheduler.run_until()
-    assert scheduler.records["a"].status is RunStatus.FAILED
+    result = scheduler.run_until()
+    assert scheduler.records["a"].status is RunStatus.COMPLETED
+    assert scheduler.records["a"].end_time == 13
     recovered = scheduler.cluster.runtime_for(node_a)
     assert recovered.available is True and recovered.used_memory == 0
+    assert "a" in result.waiting
 
 
 def test_pending_job_avoids_unavailable_node():
