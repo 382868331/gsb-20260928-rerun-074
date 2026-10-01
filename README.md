@@ -5,7 +5,10 @@
 
 ## 资源模型
 
-- 节点只有两类资源：内存（MB）与并发槽（max_jobs）。
+- 节点资源：内存（MB）、并发槽（max_jobs）与可选具名资源
+  （capacity={"cpu": 8, "gpu": 1}，独占设备用 1 份表示）。
+- 阶段可同时声明多类资源（Stage(resources={"gpu": 1})），调度是
+  全有或全无：任何一类不满足都不启动，等待期间不持有任何资源。
 - 任务在真正 start 时才占用资源；排队期间不预占。
 - 完成、失败、取消走同一条幂等释放路径，NodeRuntime.release 对同一实验
   重复调用第二次返回 False，保证只释放一次。
@@ -40,6 +43,31 @@ Cluster.find_placement 校验内存与并发槽，容量不足返回 None，绝�
         priority=0,
     )
 
+## 节点维护窗口与迁移限制
+
+add_maintenance(node_id, MaintenanceWindow(start, end)) 登记计划维护：
+
+- 区间内节点不接受新放置；前瞻规划自动绕开窗口，声明
+  migratable=False 的阶段若会跨窗口运行则整体推迟到维护结束后。
+- 窗口开始时，当前阶段 migratable=True 的任务迁移到其他节点，保留
+  阶段进度（结束时刻不变，阶段不重算）；无处可去则释放全部资源并
+  显式等待，绝不占着已不需要的容量。
+- migratable=False 的阶段绝不打断：留在本节点跑到阶段结束
+  （maintenance_wait 事件），维护只为它推迟生效。
+
+## 阻塞原因区分
+
+排队任务每个 tick 判定互斥的阻塞原因（RunRecord.block_reason 与
+blocked 事件，SimulationResult.blocked 汇总）：
+
+1. BlockReason.MAINTENANCE：所有容量足够的节点都在维护/不可用，
+   或前瞻启动时刻被维护窗口推迟；
+2. BlockReason.BUDGET：Scheduler(budget=N) 的集群级同时在跑阶段数
+   已达上限；
+3. BlockReason.RESOURCE_SHORTAGE：资源不足，等已在跑任务释放。
+
+判定优先级：维护 > 预算 > 资源不足。
+
 ## 公平策略：老化提权 + 饥饿预留
 
 1. experiment_id 是实验的稳定身份，队列策略只改变服务顺序。
@@ -61,10 +89,13 @@ add_outage(node_id, Outage(start, end))：
 ## 状态保存与接续模拟
 
 Scheduler.save_state(path) 保存时钟、节点、需求、运行记录（含完整事件
-流水）与未来事件堆；Scheduler.load_state(path) 后可直接 run_until 继续
-模拟，实验身份与在跑任务的占用都会恢复。
+流水）、维护窗口、调度预算与未来事件堆；Scheduler.load_state(path) 后
+可直接 run_until 继续模拟，实验身份与在跑任务的占用都会恢复。
+tests/test_multiresource.py 验证：中途保存重开的事件流水与资源账目和
+不中断运行完全一致，每个阶段只完成一次。
 
 ## 运行
     .venv/bin/python examples/demo.py
     .venv/bin/python examples/multistage_demo.py
+    .venv/bin/python examples/maintenance_demo.py
     .venv/bin/python -m pytest -q
