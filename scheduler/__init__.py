@@ -3,6 +3,12 @@
 from .models import Node, ExperimentRequest, RunRecord, RunStatus, Cluster, Stage, Outage
 from .simulator import Scheduler, SimulationResult
 from .queue import FairQueuePolicy, Blockage, RESOURCE_SHORTAGE, MAINTENANCE, BUDGET_LIMIT
+from .reservations import (
+    Reservation,
+    ReservationConflictError,
+    ReservationStatus,
+    ReservedWindow,
+)
 
 __all__ = [
     "Node",
@@ -19,4 +25,8 @@ __all__ = [
     "RESOURCE_SHORTAGE",
     "MAINTENANCE",
     "BUDGET_LIMIT",
+    "Reservation",
+    "ReservationConflictError",
+    "ReservationStatus",
+    "ReservedWindow",
 ]

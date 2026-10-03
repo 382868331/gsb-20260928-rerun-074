@@ -74,6 +74,32 @@ add_outage(node_id, Outage(start, end))：
 - `maintenance`：容量存在，但唯一可行节点处于维护窗口；
 - `budget_limit`：本次 `run_until(..., schedule_budget=n)` 最多只允许新启动 n 个阶段。
 
+## 资源预约：承诺与实际占用分离
+
+`Scheduler.reserve(experiment_id, deadline, not_before=None)` 为一组有共同
+交付期限的阶段建立资源预约：
+
+1. 预约是承诺不是占用：ReservedWindow 只在前瞻规划中阻塞其他实验，真正
+   start 时才走 NodeRuntime.allocate；`capacity_view()` 在任务未开始时
+   就能看到各节点已承诺（windows / reserved_now）与仍可分配
+   （allocatable_now）的容量。
+2. 后到任务不能无说明地挤掉已确认预约：队列前瞻把他人窗口当作区间级硬
+   约束（开始负增量、结束正增量），被挡住的任务在 `last_blockages` 中
+   留下明确原因；属主自己的窗口不参与自我阻塞。
+3. 窗口被消费（consumed）后即停止阻塞：承诺转为实际占用的瞬间只计一次账，
+   阶段间释放再申请、多类资源同时需要都不会重复扣账。
+4. 期限内排不下全部阶段时抛出 ReservationConflictError，conflicts 携带
+   冲突范围（阶段、各节点最早可排时刻、期限差距），绝不伪造可行日程。
+5. `withdraw_reservation(rid)` / `adjust_reservation(rid, stages=, deadline=)`
+   撤回或调整未消费部分，返回 {before, after, changed} 报告对其他排队任务
+   阻塞原因的影响；`assess_withdrawal(rid)` 只评估不执行。调整不可行时
+   原承诺保持不变。
+6. 维护计划改变（add_outage 与窗口重叠）或实际启动晚于窗口时，预约被标记
+   BREACHED 并记录 breach_reasons；承诺（Reservation.events）、实际执行
+   （RunRecord.events）与违约原因三条账目分别保存，随时可独立核对。
+7. 预约随 save_state/load_state 持久化：维护延长、任务提前结束、预约取消
+   交错的场景保存后接续，原承诺、实际执行与违约原因仍然各自可查。
+
 ## 状态保存与接续模拟
 
 Scheduler.save_state(path) 保存时钟、节点、命名资源占用、维护窗口、调度预算、

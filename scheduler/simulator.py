@@ -20,10 +20,23 @@ from .models import (
 )
 from .queue import FairQueuePolicy, QueueEntry
 from .queue import BUDGET_LIMIT, MAINTENANCE, RESOURCE_SHORTAGE
+from .reservations import (
+    Reservation,
+    ReservationConflictError,
+    ReservationStatus,
+    ReservedWindow,
+    earliest_interval,
+    plan_stage_windows,
+)
 
 
 class CapacityInfeasibleError(RuntimeError):
     """需求超过任何单个空节点的容量：排产即不可能，拒绝入队。"""
+
+
+def _diff_blockages(before: dict, after: dict) -> dict:
+    keys = set(before) | set(after)
+    return {k: (before.get(k), after.get(k)) for k in sorted(keys) if before.get(k) != after.get(k)}
 
 
 @dataclass
@@ -59,6 +72,7 @@ class Scheduler:
         self._yield_requested: dict[str, str] = {}
         self.outages: dict[str, list[tuple[int, int]]] = {node.node_id: [] for node in nodes}
         self.last_blockages: dict[str, str] = {}
+        self.reservations: dict[str, Reservation] = {}
 
     # ---- 提交与容量校验 -------------------------------------------------
 
@@ -203,6 +217,7 @@ class Scheduler:
             release_events,
             outages=self.outages,
             schedule_budget=budget,
+            reservation_events=self._reservation_events_by_node(),
         )
         self.last_blockages = {b.experiment_id: b.reason for b in blockages}
         result.blocked.extend(b.experiment_id for b in blockages)
@@ -219,7 +234,7 @@ class Scheduler:
                 blocked.append(entry)
                 continue
             runtime = self.cluster.runtime_for(target.node_id)
-            node_id = target.node_id if runtime.can_fit(resources=entry.demand) else None
+            node_id = target.node_id if self._fits_with_reservations(runtime, entry.demand, eid) else None
             if node_id is None:
                 blocked.append(entry)
                 continue
@@ -353,6 +368,7 @@ class Scheduler:
         resume_duration = record.stage_remaining
         duration = resume_duration if resume_duration is not None else stage.duration
         self.cluster.runtime_for(node_id).allocate(eid, stage.resource_request)
+        self._consume_reservation_window(eid, stage_index, node_id)
         record.status = RunStatus.RUNNING
         record.node_id = node_id
         record.stage_index = stage_index
@@ -410,6 +426,7 @@ class Scheduler:
             record.stage_started_at = None
             self._yield_requested.pop(eid, None)
             record.log(self.now, "completed", f"node={record.node_id}")
+            self._close_reservation(eid, "completed")
             result.completed.append(eid)
             return
         stage = req.stage_list[finished_stage]
@@ -445,6 +462,7 @@ class Scheduler:
         record.pinned_node_id = None
         record.log(self.now, status.value, f"node={record.node_id}")
         self._event_for.pop(eid, None)
+        self._close_reservation(eid, status.value)
         (result.completed if status is RunStatus.COMPLETED else result.failed).append(eid)
 
     def _cancel(self, eid: str, result: SimulationResult) -> None:
@@ -462,6 +480,7 @@ class Scheduler:
         record.pinned_node_id = None
         self._yield_requested.pop(eid, None)
         record.log(self.now, "cancelled")
+        self._close_reservation(eid, "cancelled")
         for key in list(self._event_for):
             if str(key).startswith(f"maintenance-resume-{eid}-"):
                 self._event_for.pop(key, None)
@@ -476,6 +495,360 @@ class Scheduler:
         self.outages.setdefault(node_id, []).append((outage.start, outage.end))
         self._push(outage.start, ("outage_on", node_id), key=f"outage-on-{node_id}-{outage.start}")
         self._push(outage.end, ("outage_off", node_id), key=f"outage-off-{node_id}-{outage.end}")
+        self._mark_maintenance_breaches(node_id, outage)
+
+    # ---- 资源预约 -------------------------------------------------------
+
+    def reserve(
+        self,
+        experiment_id: str,
+        deadline: int,
+        not_before: Optional[int] = None,
+        reservation_id: Optional[str] = None,
+    ) -> Reservation:
+        """为实验剩余阶段建立带共同交付期限的资源预约。
+
+        预约是承诺不是占用：只在队列前瞻规划中阻塞其他实验，真正 start 时
+        才走 NodeRuntime.allocate。期限内排不下全部阶段时抛出
+        ReservationConflictError 并携带冲突范围，绝不伪造可行日程。
+        """
+        if experiment_id not in self.requests:
+            raise ValueError(f"未知实验 {experiment_id}")
+        record = self.records[experiment_id]
+        if record.status.terminal:
+            raise ValueError(f"实验 {experiment_id} 已结束，不能预约")
+        if any(
+            res.experiment_id == experiment_id and res.active_windows
+            for res in self.reservations.values()
+        ):
+            raise ValueError(f"实验 {experiment_id} 已有活动预约，请先撤回或调整")
+        rid = reservation_id or f"res-{experiment_id}"
+        if rid in self.reservations:
+            raise ValueError(f"预约 {rid} 已存在")
+        req = self.requests[experiment_id]
+        stages = list(req.stage_list)[record.stage_index:]
+        cursor = max(self.now, not_before or 0, req.submit_time)
+        states = self._reservation_node_states()
+        planned = plan_stage_windows(stages, states, cursor, deadline)
+        if planned is None:
+            conflicts = self._diagnose_conflicts(stages, cursor, deadline, record.stage_index)
+            raise ReservationConflictError(
+                f"实验 {experiment_id} 在期限 {deadline} 内无法排下全部阶段", conflicts
+            )
+        reservation = Reservation(rid, experiment_id, deadline)
+        for offset, (node_id, start, end) in enumerate(planned):
+            stage_index = record.stage_index + offset
+            reservation.windows.append(ReservedWindow(
+                window_id=f"{rid}#s{stage_index}",
+                node_id=node_id,
+                stage_index=stage_index,
+                start=start,
+                end=end,
+                demand=stages[offset].resource_request,
+            ))
+        summary = ";".join(f"{w.window_id}@{w.node_id}[{w.start},{w.end})" for w in reservation.windows)
+        reservation.log(self.now, "reserved", f"deadline={deadline} {summary}")
+        self.reservations[rid] = reservation
+        record.log(self.now, "reservation_confirmed", f"reservation={rid} deadline={deadline}")
+        return reservation
+
+    def withdraw_reservation(self, reservation_id: str) -> dict:
+        """撤回预约：释放全部未消费窗口，并返回对其他任务阻塞原因的影响。"""
+        res = self._get_reservation(reservation_id)
+        impact = self.assess_withdrawal(reservation_id)
+        for window in res.active_windows:
+            window.released = True
+            res.log(self.now, "window_released", f"window={window.window_id} reason=withdrawn")
+        res.status = ReservationStatus.WITHDRAWN
+        res.log(self.now, "withdrawn")
+        self.records[res.experiment_id].log(
+            self.now, "reservation_withdrawn", f"reservation={reservation_id}"
+        )
+        return impact
+
+    def adjust_reservation(
+        self,
+        reservation_id: str,
+        stages: Optional[list[Stage]] = None,
+        deadline: Optional[int] = None,
+    ) -> dict:
+        """调整预约的未消费部分：重新规划窗口并比较对其他任务的影响。
+
+        新方案不可行时抛出 ReservationConflictError，原承诺保持不变。
+        """
+        res = self._get_reservation(reservation_id)
+        if res.status is ReservationStatus.WITHDRAWN:
+            raise ValueError(f"预约 {reservation_id} 已撤回，不能调整")
+        req = self.requests[res.experiment_id]
+        record = self.records[res.experiment_id]
+        open_indices = [w.stage_index for w in res.active_windows]
+        first_open = min(open_indices) if open_indices else record.stage_index
+        new_stages = list(stages) if stages is not None else list(req.stage_list)[first_open:]
+        new_deadline = deadline if deadline is not None else res.deadline
+        states = self._reservation_node_states(exclude_reservation_id=reservation_id)
+        cursor = max(self.now, req.submit_time)
+        planned = plan_stage_windows(new_stages, states, cursor, new_deadline)
+        if planned is None:
+            conflicts = self._diagnose_conflicts(
+                new_stages, cursor, new_deadline, first_open, exclude_reservation_id=reservation_id
+            )
+            raise ReservationConflictError(
+                f"预约 {reservation_id} 调整后期限 {new_deadline} 内不可行", conflicts
+            )
+        before = self._current_blockages()
+        replaced = res.active_windows
+        for window in replaced:
+            window.released = True
+            res.log(self.now, "window_replaced", f"window={window.window_id}")
+        for offset, (node_id, start, end) in enumerate(planned):
+            stage_index = first_open + offset
+            res.windows.append(ReservedWindow(
+                window_id=f"{reservation_id}#a{len(res.windows)}",
+                node_id=node_id,
+                stage_index=stage_index,
+                start=start,
+                end=end,
+                demand=new_stages[offset].resource_request,
+            ))
+        res.deadline = new_deadline
+        res.log(self.now, "adjusted", f"deadline={new_deadline} replaced={len(replaced)}")
+        record.log(self.now, "reservation_adjusted", f"reservation={reservation_id}")
+        after = self._current_blockages()
+        return {
+            "reservation": res,
+            "before": before,
+            "after": after,
+            "changed": _diff_blockages(before, after),
+        }
+
+    def assess_withdrawal(self, reservation_id: str) -> dict:
+        """不实际撤回，只比较撤回前后其他排队任务的阻塞原因。"""
+        res = self._get_reservation(reservation_id)
+        before = self._current_blockages()
+        active = res.active_windows
+        for window in active:
+            window.released = True
+        try:
+            after = self._current_blockages()
+        finally:
+            for window in active:
+                window.released = False
+        return {"before": before, "after": after, "changed": _diff_blockages(before, after)}
+
+    def capacity_view(self, node_id: Optional[str] = None) -> dict:
+        """各节点当前已承诺与仍可分配的容量视图（任务未开始也可见）。"""
+        node_ids = [node_id] if node_id else list(self.cluster.runtime)
+        view: dict[str, dict] = {}
+        for nid in node_ids:
+            runtime = self.cluster.runtime_for(nid)
+            reserved_now = self._reserved_now(nid, exclude_owner=None)
+            windows = []
+            for res in self.reservations.values():
+                for window in res.active_windows:
+                    if window.node_id == nid:
+                        windows.append({
+                            **window.to_dict(),
+                            "reservation_id": res.reservation_id,
+                            "experiment_id": res.experiment_id,
+                        })
+            view[nid] = {
+                "capacity": dict(runtime.node.resource_capacity),
+                "used": dict(runtime.used),
+                "reserved_now": reserved_now,
+                "allocatable_now": {
+                    name: runtime.free_resource(name) - reserved_now.get(name, 0)
+                    for name in runtime.node.resource_capacity
+                },
+                "windows": sorted(windows, key=lambda w: (w["start"], w["window_id"])),
+            }
+        return view
+
+    def _get_reservation(self, reservation_id: str) -> Reservation:
+        if reservation_id not in self.reservations:
+            raise ValueError(f"未知预约 {reservation_id}")
+        return self.reservations[reservation_id]
+
+    def _reservation_node_states(self, exclude_reservation_id: Optional[str] = None) -> dict:
+        states: dict[str, dict] = {}
+        release_events = self._collect_release_events()
+        for node_id, runtime in self.cluster.runtime.items():
+            events: list[tuple[int, dict[str, int]]] = []
+            used = {name: amount for name, amount in runtime.used.items() if amount}
+            if used:
+                events.append((self.now, used))
+            for fire_time, demand, _eid in release_events.get(node_id, []):
+                events.append((fire_time, {name: -amount for name, amount in demand.items()}))
+            states[node_id] = {
+                "capacity": dict(runtime.node.resource_capacity),
+                "events": events,
+                "outages": list(self.outages.get(node_id, [])),
+            }
+        for res in self.reservations.values():
+            if res.reservation_id == exclude_reservation_id:
+                continue
+            for window in res.active_windows:
+                state = states[window.node_id]
+                state["events"].append((window.start, dict(window.demand)))
+                state["events"].append((
+                    window.end, {name: -amount for name, amount in window.demand.items()}
+                ))
+        return states
+
+    def _diagnose_conflicts(
+        self,
+        stages: list[Stage],
+        cursor: int,
+        deadline: int,
+        stage_offset: int,
+        exclude_reservation_id: Optional[str] = None,
+    ) -> list[dict]:
+        """定位第一个无法在期限内排下的阶段，给出冲突范围而非伪日程。"""
+        states = self._reservation_node_states(exclude_reservation_id=exclude_reservation_id)
+        for offset, stage in enumerate(stages):
+            demand = stage.resource_request
+            best: Optional[tuple[int, str]] = None
+            per_node: dict[str, Optional[int]] = {}
+            for node_id, state in states.items():
+                start = earliest_interval(
+                    state["capacity"], state["events"], state["outages"], demand, cursor, stage.duration
+                )
+                per_node[node_id] = start
+                if start is not None and (best is None or start < best[0]):
+                    best = (start, node_id)
+            if best is None:
+                return [{
+                    "stage_index": stage_offset + offset,
+                    "reason": "no node can ever fit the stage demand",
+                    "demand": demand,
+                }]
+            start, node_id = best
+            if start + stage.duration > deadline:
+                return [{
+                    "stage_index": stage_offset + offset,
+                    "reason": "deadline too tight",
+                    "deadline": deadline,
+                    "earliest_end": start + stage.duration,
+                    "earliest_node": node_id,
+                    "per_node_earliest_start": per_node,
+                }]
+            state = states[node_id]
+            state["events"].append((start, dict(demand)))
+            state["events"].append((
+                start + stage.duration, {name: -amount for name, amount in demand.items()}
+            ))
+            cursor = start + stage.duration
+        return []
+
+    def _reservation_events_by_node(self) -> dict[str, list[tuple]]:
+        """预约窗口转为 (时刻, 可用增量, 属主) 事件，供队列前瞻过滤。
+
+        队列事件约定为"该时刻释放多少容量"：窗口开始是负增量（承诺生效），
+        窗口结束是正增量（承诺解除）。
+        """
+        events: dict[str, list[tuple]] = {}
+        for res in self.reservations.values():
+            for window in res.active_windows:
+                node_events = events.setdefault(window.node_id, [])
+                node_events.append((
+                    window.start,
+                    {name: -amount for name, amount in window.demand.items()},
+                    res.experiment_id,
+                ))
+                node_events.append((
+                    window.end,
+                    dict(window.demand),
+                    res.experiment_id,
+                ))
+        return events
+
+    def _reserved_now(self, node_id: str, exclude_owner: Optional[str]) -> dict[str, int]:
+        reserved: dict[str, int] = {}
+        for res in self.reservations.values():
+            if exclude_owner is not None and res.experiment_id == exclude_owner:
+                continue
+            for window in res.active_windows:
+                if window.node_id == node_id and window.covers(self.now):
+                    for name, amount in window.demand.items():
+                        reserved[name] = reserved.get(name, 0) + amount
+        return reserved
+
+    def _fits_with_reservations(self, runtime, demand: dict[str, int], eid: str) -> bool:
+        if not runtime.available:
+            return False
+        reserved = self._reserved_now(runtime.node.node_id, exclude_owner=eid)
+        return all(
+            amount <= runtime.free_resource(name) - reserved.get(name, 0)
+            for name, amount in demand.items()
+        )
+
+    def _consume_reservation_window(self, eid: str, stage_index: int, node_id: str) -> None:
+        """实验真正 start 时消费对应窗口：承诺转为实际占用，绝不重复扣账。"""
+        for res in self.reservations.values():
+            if res.experiment_id != eid:
+                continue
+            for window in res.active_windows:
+                if window.stage_index != stage_index:
+                    continue
+                window.consumed = True
+                res.log(
+                    self.now,
+                    "window_consumed",
+                    f"window={window.window_id} node={node_id} reserved_node={window.node_id}",
+                )
+                if self.now > window.end:
+                    reason = (
+                        f"stage {stage_index} started at {self.now}, "
+                        f"after reserved window [{window.start},{window.end})"
+                    )
+                    res.breach_reasons.append(reason)
+                    res.status = ReservationStatus.BREACHED
+                    res.log(self.now, "breached", reason)
+                return
+
+    def _close_reservation(self, eid: str, reason: str) -> None:
+        """实验终态时释放剩余窗口；承诺账与实际账分别落日志。"""
+        for res in self.reservations.values():
+            if res.experiment_id != eid:
+                continue
+            remaining = res.active_windows
+            if not remaining and res.status is not ReservationStatus.CONFIRMED:
+                continue
+            for window in remaining:
+                window.released = True
+                res.log(self.now, "window_released", f"window={window.window_id} reason={reason}")
+            if res.status is ReservationStatus.CONFIRMED and reason == "completed":
+                res.status = ReservationStatus.FULFILLED
+            res.log(self.now, "reservation_closed", f"reason={reason}")
+
+    def _mark_maintenance_breaches(self, node_id: str, outage: Outage) -> None:
+        """维护计划改变时，明确标出受影响的承诺，不让其被静默挤掉。"""
+        for res in self.reservations.values():
+            for window in res.active_windows:
+                if window.node_id != node_id or not window.overlaps(outage.start, outage.end):
+                    continue
+                reason = (
+                    f"maintenance {node_id} [{outage.start},{outage.end}) "
+                    f"overlaps window {window.window_id} [{window.start},{window.end})"
+                )
+                if reason in res.breach_reasons:
+                    continue
+                res.breach_reasons.append(reason)
+                res.status = ReservationStatus.BREACHED
+                res.log(self.now, "breached", reason)
+                self.records[res.experiment_id].log(
+                    self.now, "reservation_breached", f"reservation={res.reservation_id}"
+                )
+
+    def _current_blockages(self) -> dict[str, str]:
+        _, blockages = self.queue.plan_targets(
+            self.now,
+            self.cluster,
+            self._collect_release_events(),
+            outages=self.outages,
+            schedule_budget=self.schedule_budget,
+            reservation_events=self._reservation_events_by_node(),
+        )
+        return {b.experiment_id: b.reason for b in blockages}
 
     def _node_under_maintenance(self, node_id: str, time: int) -> bool:
         return any(start <= time < end for start, end in self.outages.get(node_id, []))
@@ -624,6 +997,7 @@ class Scheduler:
                 for victim, requester in sorted(self._yield_requested.items())
             ],
             "event_for": {k: list(v) for k, v in self._event_for.items()},
+            "reservations": [res.to_dict() for res in self.reservations.values()],
         }
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -695,5 +1069,9 @@ class Scheduler:
                 (raw["time"], raw["seq"], (raw["payload_kind"], raw["experiment_id"])),
             )
         scheduler._counter = itertools.count(data.get("counter", -1) + 1)
+        scheduler.reservations = {
+            raw["reservation_id"]: Reservation.from_dict(raw)
+            for raw in data.get("reservations", [])
+        }
         scheduler._refresh_runtime_availability()
         return scheduler
