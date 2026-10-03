@@ -9,6 +9,8 @@ from typing import Optional
 RESOURCE_SHORTAGE = "resource_shortage"
 MAINTENANCE = "maintenance"
 BUDGET_LIMIT = "budget_limit"
+RESERVATION_CONFLICT = "reservation_conflict"
+DEADLINE_MISSED = "deadline_missed"
 
 
 @dataclass
@@ -21,6 +23,9 @@ class QueueEntry:
     stage_index: int = 0
     resources: Optional[dict[str, int]] = None
     pinned_node_id: Optional[str] = None
+    reservation_id: Optional[str] = None
+    reserved_start: Optional[int] = None
+    deadline: Optional[int] = None
 
     def priority_score(self, now: int, starvation_threshold: int) -> int:
         wait = max(0, now - self.submit_time)
@@ -56,6 +61,7 @@ class FairQueuePolicy:
             raise ValueError("饥饿阈值必须为正数")
         self.starvation_threshold = starvation_threshold
         self.pending: list[QueueEntry] = []
+        self._current_reservation_id: Optional[str] = None
 
     def add(self, entry: QueueEntry) -> None:
         if any(e.experiment_id == entry.experiment_id for e in self.pending):
@@ -89,41 +95,63 @@ class FairQueuePolicy:
         release_events: Optional[dict[str, list[tuple]]] = None,
         outages: Optional[dict[str, list[tuple[int, int]]]] = None,
         schedule_budget: Optional[int] = None,
+        reservations: Optional[list] = None,
     ) -> tuple[dict[str, Target], list[Blockage]]:
         release_events = release_events or {}
         outages = outages or {}
         states: dict[str, dict] = {}
+        reservations = reservations or []
         for node_id, runtime in cluster.runtime.items():
-            merged_events: dict[str, tuple[int, dict[str, int]]] = {}
+            events: list[tuple[int, dict[str, int], object]] = []
+            merged_events: dict[object, tuple[int, dict[str, int]]] = {}
             for item in release_events.get(node_id, []):
                 t, demand, eid = item
                 if eid not in merged_events or t < merged_events[eid][0]:
                     merged_events[eid] = (t, dict(demand))
-            events = [(t, demand, eid) for eid, (t, demand) in merged_events.items()]
+            events.extend((t, demand, eid) for eid, (t, demand) in merged_events.items())
+            for reservation in reservations:
+                if reservation.node_id != node_id:
+                    continue
+                demand = dict(reservation.demand)
+                events.append((reservation.start, {k: -v for k, v in demand.items()}, reservation.reservation_id))
+                events.append((reservation.end, demand, reservation.reservation_id))
             states[node_id] = {
                 "capacity": dict(runtime.node.resource_capacity),
-                "events": events,
+                "events": sorted(events, key=lambda item: item[0]),
                 "outages": sorted(outages.get(node_id, [])),
                 "available": runtime.available,
+                "initial_used": dict(runtime.used),
             }
 
         targets: dict[str, Target] = {}
         blockages: list[Blockage] = []
         budget = schedule_budget
         for entry in self.ordered(now):
+            self._current_reservation_id = entry.reservation_id
             if budget is not None and budget <= 0:
                 blockages.append(Blockage(entry.experiment_id, BUDGET_LIMIT, "schedule budget exhausted"))
                 continue
 
             node_ids = [entry.pinned_node_id] if entry.pinned_node_id else list(states)
             choices: list[tuple[int, str]] = []
+            exact_time = entry.reserved_start
             for node_id in node_ids:
-                start = self._earliest_start(entry.demand, now, states[node_id])
+                start = self._earliest_start(
+                    entry.demand,
+                    now,
+                    states[node_id],
+                    exact_time=exact_time,
+                    deadline=entry.deadline,
+                    current_reservation_id=entry.reservation_id,
+                )
                 if start is not None:
                     choices.append((start, node_id))
 
             if not choices:
-                if self._cluster_has_capacity(cluster, entry.demand):
+                if entry.reservation_id is not None:
+                    reason = RESERVATION_CONFLICT
+                    detail = f"reservation={entry.reservation_id} cannot be honored"
+                elif self._cluster_has_capacity(cluster, entry.demand):
                     reason = MAINTENANCE
                     detail = "only eligible node is under maintenance"
                 else:
@@ -153,6 +181,12 @@ class FairQueuePolicy:
                     MAINTENANCE if maintenance_delayed else RESOURCE_SHORTAGE,
                     f"earliest_start={start} node={node_id}",
                 ))
+            if entry.deadline is not None and start + entry.duration > entry.deadline:
+                blockages.append(Blockage(
+                    entry.experiment_id,
+                    DEADLINE_MISSED,
+                    f"finish={start + entry.duration} deadline={entry.deadline} node={node_id}",
+                ))
             self._earliest_start(
                 entry.demand,
                 now,
@@ -160,9 +194,11 @@ class FairQueuePolicy:
                 commit=True,
                 duration=entry.duration,
                 forced_time=start,
+                current_reservation_id=entry.reservation_id,
             )
             if budget is not None:
                 budget -= 1
+        self._current_reservation_id = None
         return targets, blockages
 
     @staticmethod
@@ -173,32 +209,63 @@ class FairQueuePolicy:
         )
 
     @staticmethod
-    def _earliest_start(demand, now, state, commit=False, duration=None, forced_time=None):
+    def _earliest_start(demand, now, state, commit=False, duration=None, forced_time=None, exact_time=None, deadline=None, current_reservation_id=None):
+        duration = duration or 1
+        events = sorted(
+            (
+                item for item in state["events"]
+                if item[2] != current_reservation_id or current_reservation_id is None
+            ),
+            key=lambda item: item[0],
+        )
+        candidates = {now}
+        if exact_time is not None:
+            candidates.add(exact_time)
+        candidates.update(t for t, _, _ in events if t >= now)
+        candidates.update(start for start, _ in state["outages"] if start >= now)
+        candidates.update(end for _, end in state["outages"] if end >= now)
+        for t in sorted(candidates):
+            if deadline is not None and t + duration > deadline:
+                continue
+            if exact_time is not None and t != exact_time:
+                continue
+            filtered_state = dict(state)
+            filtered_state["events"] = events
+            if FairQueuePolicy._interval_fits(demand, t, t + duration, filtered_state):
+                start = forced_time if forced_time is not None else t
+                if commit:
+                    state["events"] = [
+                        item for item in state["events"]
+                        if item[2] != current_reservation_id or current_reservation_id is None
+                    ]
+                    used_demand = {k: -v for k, v in demand.items()}
+                    state["events"].append((start, used_demand, None))
+                    state["events"].append((start + duration, dict(demand), None))
+                    state["events"].sort(key=lambda item: item[0])
+                return start
+        return None
+
+    @staticmethod
+    def _interval_fits(demand, start, end, state) -> bool:
         events = sorted(state["events"], key=lambda item: item[0])
         free = {
-            name: state["capacity"][name] - sum(item.get(name, 0) for _, item, _ in events)
+            name: state["capacity"][name] - state["initial_used"].get(name, 0)
             for name in state["capacity"]
         }
-        t = now
-        idx = 0
-        while True:
-            while idx < len(events) and events[idx][0] <= t:
-                _, item, _ = events[idx]
-                for name, amount in item.items():
-                    free[name] = free.get(name, 0) + amount
-                idx += 1
-            online_at = FairQueuePolicy._online_at(state, t)
-            resource_ok = all(free.get(name, 0) >= amount for name, amount in demand.items())
-            if online_at is not None and resource_ok:
-                start = forced_time if forced_time is not None else online_at
-                if commit:
-                    state["events"].append((start + duration, dict(demand), None))
-                return start
-            future_release = events[idx][0] if idx < len(events) else None
-            future_online = FairQueuePolicy._future_online_after(state, t)
-            if future_release is None and future_online is None:
-                return None
-            t = min(value for value in (future_release, future_online) if value is not None)
+        if any(start < outage_end and outage_start < end for outage_start, outage_end in state["outages"]):
+            return False
+        changes = sorted({start, end, *(t for t, _, _ in events if start < t < end)})
+        for time in changes:
+            if time >= end:
+                continue
+            current = dict(free)
+            for event_time, item, _ in events:
+                if event_time <= time:
+                    for name, amount in item.items():
+                        current[name] = current.get(name, 0) + amount
+            if any(current.get(name, 0) < amount for name, amount in demand.items()):
+                return False
+        return True
 
     @staticmethod
     def _online_at(state, time: int) -> Optional[int]:

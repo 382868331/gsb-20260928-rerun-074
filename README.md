@@ -74,6 +74,28 @@ add_outage(node_id, Outage(start, end))：
 - `maintenance`：容量存在，但唯一可行节点处于维护窗口；
 - `budget_limit`：本次 `run_until(..., schedule_budget=n)` 最多只允许新启动 n 个阶段。
 
+## 资源预约与承诺核对
+
+`reserve_deadline(experiment_id, deadline, earliest_start=...)` 为共同交付期限
+建立预约；多阶段任务会按阶段顺序检查完整窗口。任何阶段不能在期限前完成时，
+返回 `ReservationReport(ok=False, conflicts=[...])`，冲突中给出阶段、请求时间
+范围、期限、节点和原因，不会伪造可行日程。
+
+- 预约与真实占用分开记账：未开始的容量只出现在 `promised`，真正启动后预约
+  变为 `consumed`，容量转入 `actual`，同一资源不会被预约和运行重复扣账。
+- `reservation_capacity_view(time)` 返回每个节点的 `capacity`、`promised`、
+  `actual` 和剩余 `available`，任务尚未开始也能查看已承诺容量。
+- 后到任务可以使用预约前的空闲窗口，但前瞻会检查整个运行区间，不能侵入已
+  确认预约。
+- `cancel_reservation(id)` 可撤回单个阶段预约；`adjust_reservation(id,start,end)`
+  调整预约，旧承诺会标记为 `cancelled` 并生成新 ID，释放容量可重新分配。
+- `evaluate_reservation_change(cancel_ids=[...], adjustments={...})` 不修改当前
+  模拟，而是在快照副本中比较变更前后的任务终态、启动/结束时间和等待原因。
+- 维护窗口与已确认预约重叠时，预约保留为 `breached` 并记录具体维护区间；
+  受影响承诺不会被后到任务静默替换。
+- 任务提前结束或取消时，尚未消费的后续预约会取消；预约、真实执行和违约事件
+  分别写入任务事件流水，快照中也会完整保存。
+
 ## 状态保存与接续模拟
 
 Scheduler.save_state(path) 保存时钟、节点、命名资源占用、维护窗口、调度预算、

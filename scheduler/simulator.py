@@ -20,6 +20,13 @@ from .models import (
 )
 from .queue import FairQueuePolicy, QueueEntry
 from .queue import BUDGET_LIMIT, MAINTENANCE, RESOURCE_SHORTAGE
+from .reservations import (
+    ConflictRange,
+    Reservation,
+    ReservationLedger,
+    ReservationReport,
+    ReservationStatus,
+)
 
 
 class CapacityInfeasibleError(RuntimeError):
@@ -59,6 +66,7 @@ class Scheduler:
         self._yield_requested: dict[str, str] = {}
         self.outages: dict[str, list[tuple[int, int]]] = {node.node_id: [] for node in nodes}
         self.last_blockages: dict[str, str] = {}
+        self.reservations = ReservationLedger()
 
     # ---- 提交与容量校验 -------------------------------------------------
 
@@ -93,6 +101,11 @@ class Scheduler:
         pinned_node_id: Optional[str] = None,
     ) -> QueueEntry:
         stage = request.stage_list[stage_index]
+        reservation = self.reservations.confirmed_for(
+            request.experiment_id,
+            stage_index,
+            at_time=self.now,
+        )
         entry = QueueEntry(
                 experiment_id=request.experiment_id,
                 memory_mb=stage.memory_mb,
@@ -101,7 +114,10 @@ class Scheduler:
                 priority=request.priority,
                 stage_index=stage_index,
                 resources=dict(stage.resources),
-                pinned_node_id=pinned_node_id,
+                pinned_node_id=pinned_node_id or (reservation.node_id if reservation else None),
+                reservation_id=reservation.reservation_id if reservation else None,
+                reserved_start=reservation.start if reservation else None,
+                deadline=reservation.end if reservation else None,
             )
         self.queue.add(entry)
         return entry
@@ -188,6 +204,8 @@ class Scheduler:
                 self._resume_after_maintenance(eid, result)
             elif kind == "fail":
                 self._finish(eid, RunStatus.FAILED, result)
+            elif kind == "early_finish":
+                self._finish_early(eid, result)
             elif kind == "cancel":
                 self._cancel(eid, result)
 
@@ -195,6 +213,7 @@ class Scheduler:
 
     def _schedule_pending(self, result: SimulationResult, schedule_budget: Optional[int] = None) -> int:
         self._prune_stale_yield_requests()
+        self._reconcile_due_reservations()
         release_events = self._collect_release_events()
         budget = self.schedule_budget if schedule_budget is None else schedule_budget
         targets, blockages = self.queue.plan_targets(
@@ -203,6 +222,7 @@ class Scheduler:
             release_events,
             outages=self.outages,
             schedule_budget=budget,
+            reservations=self.reservations.active_promises(include_breached=True),
         )
         self.last_blockages = {b.experiment_id: b.reason for b in blockages}
         result.blocked.extend(b.experiment_id for b in blockages)
@@ -219,11 +239,25 @@ class Scheduler:
                 blocked.append(entry)
                 continue
             runtime = self.cluster.runtime_for(target.node_id)
-            node_id = target.node_id if runtime.can_fit(resources=entry.demand) else None
-            if node_id is None:
+            reservation = self._reservation_for_entry(entry)
+            if reservation is not None:
+                if (
+                    reservation.status is not ReservationStatus.CONFIRMED
+                    or reservation.node_id != target.node_id
+                    or not (reservation.start <= self.now <= reservation.end)
+                ):
+                    blocked.append(entry)
+                    continue
+                self.reservations.consume(reservation.reservation_id)
+                self.records[eid].log(
+                    self.now,
+                    "reservation_consumed",
+                    f"reservation={reservation.reservation_id} node={target.node_id}",
+                )
+            if not runtime.can_fit(resources=entry.demand):
                 blocked.append(entry)
                 continue
-            self._start_stage(eid, node_id, entry.stage_index, result)
+            self._start_stage(eid, target.node_id, entry.stage_index, result)
             started_count += 1
             if remaining_budget is not None:
                 remaining_budget -= 1
@@ -244,6 +278,59 @@ class Scheduler:
         for victim, requester in list(self._yield_requested.items()):
             if requester not in active_blocked_ids:
                 del self._yield_requested[victim]
+
+    def _reservation_for_entry(self, entry: QueueEntry) -> Optional[Reservation]:
+        if entry.reservation_id is None:
+            return None
+        try:
+            return self.reservations.get(entry.reservation_id)
+        except KeyError:
+            return None
+
+    def _reconcile_due_reservations(self) -> None:
+        for entry in self.queue.pending:
+            reservation = self._reservation_for_entry(entry)
+            if reservation is None:
+                continue
+            if reservation.status is ReservationStatus.BREACHED:
+                entry.pinned_node_id = None
+                entry.reservation_id = None
+                entry.reserved_start = None
+                entry.deadline = None
+                continue
+            if reservation.status != ReservationStatus.CONFIRMED:
+                self._detach_entry_reservation(entry)
+                continue
+            if self.now < reservation.start:
+                entry.pinned_node_id = reservation.node_id
+                entry.reserved_start = reservation.start
+                entry.deadline = reservation.end
+                continue
+            if self.now >= reservation.end:
+                reason = f"reserved_window=[{reservation.start},{reservation.end}) missed at {self.now}"
+                self.reservations.mark_breached(reservation.reservation_id, reason)
+                record = self.records.get(reservation.experiment_id)
+                if record is not None:
+                    record.log(self.now, "reservation_breached", f"reservation={reservation.reservation_id} {reason}")
+                self._detach_entry_reservation(entry)
+                continue
+            entry.pinned_node_id = reservation.node_id
+            entry.reserved_start = self.now
+            entry.deadline = reservation.end
+
+    def _detach_entry_reservation(self, entry: QueueEntry) -> None:
+        entry.pinned_node_id = None
+        entry.reservation_id = None
+        entry.reserved_start = None
+        entry.deadline = None
+
+    def _bind_queue_reservation(self, reservation: Reservation) -> None:
+        for entry in self.queue.pending:
+            if entry.experiment_id == reservation.experiment_id and entry.stage_index == reservation.stage_index:
+                entry.reservation_id = reservation.reservation_id
+                entry.pinned_node_id = reservation.node_id
+                entry.reserved_start = reservation.start
+                entry.deadline = reservation.end
 
     def _request_safe_point_yields(
         self,
@@ -405,6 +492,7 @@ class Scheduler:
         record.stage_remaining = None
         next_index = finished_stage + 1
         if next_index >= len(req.stage_list):
+            self._cancel_future_reservations(eid, finished_stage, "experiment_completed")
             record.status = RunStatus.COMPLETED
             record.end_time = self.now
             record.stage_started_at = None
@@ -439,6 +527,7 @@ class Scheduler:
         runtime = self.cluster.runtime_for(record.node_id)
         released = runtime.release(eid)
         assert released
+        self._cancel_future_reservations(eid, record.stage_index + 1, status.value)
         record.status = status
         record.end_time = self.now
         record.stage_started_at = None
@@ -446,6 +535,14 @@ class Scheduler:
         record.log(self.now, status.value, f"node={record.node_id}")
         self._event_for.pop(eid, None)
         (result.completed if status is RunStatus.COMPLETED else result.failed).append(eid)
+
+    def _finish_early(self, eid: str, result: SimulationResult) -> None:
+        record = self.records.get(eid)
+        if record is None or record.status is not RunStatus.RUNNING:
+            return
+        self._remove_existing_stage_end(eid)
+        self._finish(eid, RunStatus.COMPLETED, result)
+        record.log(self.now, "finished_early")
 
     def _cancel(self, eid: str, result: SimulationResult) -> None:
         record = self.records.get(eid)
@@ -456,6 +553,7 @@ class Scheduler:
             assert released
         else:
             self.queue.remove(eid)
+        self._cancel_future_reservations(eid, record.stage_index, "experiment_cancelled")
         record.status = RunStatus.CANCELLED
         record.end_time = self.now
         record.stage_started_at = None
@@ -476,6 +574,16 @@ class Scheduler:
         self.outages.setdefault(node_id, []).append((outage.start, outage.end))
         self._push(outage.start, ("outage_on", node_id), key=f"outage-on-{node_id}-{outage.start}")
         self._push(outage.end, ("outage_off", node_id), key=f"outage-off-{node_id}-{outage.end}")
+        self._mark_outage_reservation_breaches(node_id, outage)
+
+    def _mark_outage_reservation_breaches(self, node_id: str, outage: Outage) -> None:
+        for item in self.reservations.list(ReservationStatus.CONFIRMED):
+            if item.node_id == node_id and item.overlaps(outage.start, outage.end):
+                reason = f"maintenance=[{outage.start},{outage.end}) overlaps promise=[{item.start},{item.end})"
+                self.reservations.mark_breached(item.reservation_id, reason)
+                record = self.records.get(item.experiment_id)
+                if record is not None:
+                    record.log(outage.start, "reservation_breached", f"reservation={item.reservation_id} {reason}")
 
     def _node_under_maintenance(self, node_id: str, time: int) -> bool:
         return any(start <= time < end for start, end in self.outages.get(node_id, []))
@@ -542,6 +650,344 @@ class Scheduler:
         self._push(self.now + duration, ("stage_end", eid), key=eid)
         result.started.append(eid)
 
+    # ---- 预约 -----------------------------------------------------------
+
+    def reserve_stage(
+        self,
+        experiment_id: str,
+        stage_index: int,
+        deadline: int,
+        *,
+        earliest_start: Optional[int] = None,
+        reservation_id: Optional[str] = None,
+    ) -> ReservationReport:
+        request = self.requests[experiment_id]
+        stages = request.stage_list
+        if not 0 <= stage_index < len(stages):
+            raise IndexError("阶段序号超出范围")
+        start = max(self.now if earliest_start is None else earliest_start, self.now)
+        reservation_id = reservation_id or f"{experiment_id}-s{stage_index}-{len(self.reservations.to_list()) + 1}"
+        stage = stages[stage_index]
+        window = self._find_stage_window(experiment_id, stage_index, stage.resource_request, stage.duration, start, deadline)
+        if window is None:
+            return ReservationReport(
+                ok=False,
+                conflicts=[ConflictRange(
+                    experiment_id=experiment_id,
+                    stage_index=stage_index,
+                    requested_start=start,
+                    requested_end=deadline,
+                    deadline=deadline,
+                    node_id="",
+                    reason=RESOURCE_SHORTAGE,
+                    message=f"stage={stage_index} cannot finish by deadline={deadline}",
+                )],
+            )
+        node_id, actual_start, actual_end = window
+        reservation = Reservation(
+            reservation_id=reservation_id,
+            experiment_id=experiment_id,
+            stage_index=stage_index,
+            node_id=node_id,
+            start=actual_start,
+            end=actual_end,
+            demand=dict(stage.resource_request),
+        )
+        self.reservations.add(reservation)
+        self._bind_queue_reservation(reservation)
+        record = self.records[experiment_id]
+        record.log(actual_start, "reservation_confirmed", f"reservation={reservation_id} stage={stage_index} node={node_id}")
+        return ReservationReport(ok=True, reservations=[reservation])
+
+    def reserve_deadline(
+        self,
+        experiment_id: str,
+        deadline: int,
+        *,
+        earliest_start: Optional[int] = None,
+        reservation_ids: Optional[list[str]] = None,
+    ) -> ReservationReport:
+        request = self.requests[experiment_id]
+        stages = request.stage_list
+        if deadline < self.now:
+            raise ValueError("交付期限不能早于当前时间")
+        start = max(self.now if earliest_start is None else earliest_start, self.now)
+        proposed: list[tuple[int, str, int, int]] = []
+        conflicts: list[ConflictRange] = []
+        for index, stage in enumerate(stages):
+            ids = reservation_ids or []
+            reservation_id = ids[index] if index < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
+            latest_finish = deadline - sum(s.duration for s in stages[index + 1:])
+            window = self._find_stage_window(
+                experiment_id,
+                index,
+                stage.resource_request,
+                stage.duration,
+                start,
+                latest_finish,
+                proposed=proposed,
+            )
+            if window is None:
+                blocker = self._reservation_blocker(experiment_id, index, stage.resource_request, start, latest_finish, stage.duration)
+                conflicts.append(ConflictRange(
+                    experiment_id=experiment_id,
+                    stage_index=index,
+                    requested_start=start,
+                    requested_end=latest_finish,
+                    deadline=deadline,
+                    node_id=blocker.node_id if blocker else "",
+                    reason=blocker.reason if blocker else RESOURCE_SHORTAGE,
+                    blocking_start=blocker.blocking_start if blocker else None,
+                    blocking_end=blocker.blocking_end if blocker else None,
+                    blocking_reservation_id=blocker.blocking_reservation_id if blocker else None,
+                    message=blocker.message if blocker else f"stage={index} cannot finish by {latest_finish} while meeting deadline={deadline}",
+                ))
+                continue
+            node_id, actual_start, actual_end = window
+            proposed.append((index, node_id, actual_start, actual_end))
+            start = actual_end
+        if conflicts:
+            return ReservationReport(ok=False, conflicts=conflicts)
+        items: list[Reservation] = []
+        for index, node_id, actual_start, actual_end in proposed:
+            ids = reservation_ids or []
+            reservation_id = ids[index] if index < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
+            stage = stages[index]
+            item = Reservation(
+                reservation_id=reservation_id,
+                experiment_id=experiment_id,
+                stage_index=index,
+                node_id=node_id,
+                start=actual_start,
+                end=actual_end,
+                demand=dict(stage.resource_request),
+            )
+            self.reservations.add(item)
+            self._bind_queue_reservation(item)
+            items.append(item)
+        self.records[experiment_id].log(items[0].start, "reservation_deadline_confirmed", f"deadline={deadline} reservations={','.join(i.reservation_id for i in items)}")
+        return ReservationReport(ok=True, reservations=items)
+
+    def _reservation_blocker(
+        self,
+        experiment_id: str,
+        stage_index: int,
+        demand: dict[str, int],
+        earliest: int,
+        latest_finish: int,
+        duration: int,
+    ) -> Optional[ConflictRange]:
+        latest_start = latest_finish - duration
+        if latest_start < earliest:
+            return ConflictRange(experiment_id, stage_index, earliest, latest_finish, latest_finish, "", RESOURCE_SHORTAGE, message="deadline is shorter than stage duration")
+        for node_id, node in self.cluster.nodes.items():
+            if not all(node.resource_capacity.get(name, 0) >= amount for name, amount in demand.items()):
+                continue
+            for start, end in self.outages.get(node_id, []):
+                if start < latest_finish and earliest < end:
+                    return ConflictRange(experiment_id, stage_index, earliest, latest_finish, latest_finish, node_id, MAINTENANCE, start, end, message=f"maintenance=[{start},{end}) leaves no stage window")
+            for item in self.reservations.active_promises(include_breached=True):
+                if item.node_id == node_id and item.start < latest_finish and earliest < item.end:
+                    return ConflictRange(experiment_id, stage_index, earliest, latest_finish, latest_finish, node_id, "reservation_conflict", item.start, item.end, item.reservation_id, f"blocked by reservation={item.reservation_id}")
+        return None
+
+    def _find_stage_window(
+        self,
+        experiment_id: str,
+        stage_index: int,
+        demand: dict[str, int],
+        duration: int,
+        earliest: int,
+        latest_finish: int,
+        proposed: Optional[list[tuple[int, str, int, int]]] = None,
+    ) -> Optional[tuple[str, int, int]]:
+        if latest_finish - duration < earliest:
+            return None
+        proposed = proposed or []
+        releases = self._collect_release_events()
+        for node_id, node in self.cluster.nodes.items():
+            if not all(node.resource_capacity.get(name, 0) >= amount for name, amount in demand.items()):
+                continue
+            boundaries = {earliest, latest_finish - duration}
+            for start, end in self.outages.get(node_id, []):
+                boundaries.update({start, end})
+            for fire_time, _, _ in releases.get(node_id, []):
+                boundaries.add(fire_time)
+            for item in self.reservations.active_promises(include_breached=True):
+                if item.node_id == node_id:
+                    boundaries.update({item.start, item.end})
+            for idx, proposed_node, proposed_start, proposed_end in proposed:
+                if proposed_node == node_id:
+                    boundaries.update({proposed_start, proposed_end})
+            for candidate in sorted(boundaries):
+                if not earliest <= candidate <= latest_finish - duration:
+                    continue
+                if self._window_available(node_id, demand, candidate, candidate + duration, releases, proposed, experiment_id):
+                    return node_id, candidate, candidate + duration
+        return None
+
+    def _window_available(
+        self,
+        node_id: str,
+        demand: dict[str, int],
+        start: int,
+        end: int,
+        releases: dict[str, list[tuple]],
+        proposed: list[tuple[int, str, int, int]],
+        experiment_id: str,
+    ) -> bool:
+        if any(start < outage_end and outage_start < end for outage_start, outage_end in self.outages.get(node_id, [])):
+            return False
+        node = self.cluster.nodes[node_id]
+        release_by_eid = {eid: fire_time for fire_time, _, eid in releases.get(node_id, [])}
+        allocations = dict(self.cluster.runtime_for(node_id).allocations)
+        for time in range(start, end):
+            used = {name: 0 for name in node.resource_capacity}
+            for eid, item_demand in allocations.items():
+                if release_by_eid.get(eid, 10**18) > time:
+                    for name, amount in item_demand.items():
+                        used[name] = used.get(name, 0) + amount
+            for item in self.reservations.active_promises(include_breached=True):
+                if item.node_id == node_id and item.start <= time < item.end:
+                    for name, amount in item.demand.items():
+                        used[name] = used.get(name, 0) + amount
+            for idx, proposed_node, proposed_start, proposed_end in proposed:
+                if proposed_node == node_id and proposed_start <= time < proposed_end:
+                    stage_demand = self.requests[experiment_id].stage_list[idx].resource_request
+                    for name, amount in stage_demand.items():
+                        used[name] = used.get(name, 0) + amount
+            if any(used.get(name, 0) + amount > node.resource_capacity.get(name, 0) for name, amount in demand.items()):
+                return False
+        return True
+
+    def cancel_reservation(self, reservation_id: str, reason: str = "user_cancelled") -> ReservationReport:
+        item = self.reservations.cancel(reservation_id, reason)
+        if item is None:
+            return ReservationReport(ok=False)
+        record = self.records.get(item.experiment_id)
+        if record is not None:
+            record.log(self.now, "reservation_cancelled", f"reservation={reservation_id} reason={reason}")
+        for entry in self.queue.pending:
+            if entry.reservation_id == reservation_id:
+                self._detach_entry_reservation(entry)
+        return ReservationReport(ok=True, released_capacity=[item])
+
+    def adjust_reservation(self, reservation_id: str, new_start: int, new_end: int, node_id: Optional[str] = None) -> ReservationReport:
+        old = self.reservations.get(reservation_id)
+        if old.status not in (ReservationStatus.CONFIRMED, ReservationStatus.BREACHED):
+            return ReservationReport(ok=False)
+        demand = dict(old.demand)
+        duration = new_end - new_start
+        if duration <= 0:
+            raise ValueError("预约结束时间必须晚于开始时间")
+        candidate_nodes = [node_id or old.node_id]
+        feasible_node = candidate_nodes[0]
+        if not self._window_available_without(candidate_nodes[0], demand, new_start, new_end, reservation_id):
+            alternatives = [nid for nid in self.cluster.nodes if nid != old.node_id and self._window_available_without(nid, demand, new_start, new_end, reservation_id)]
+            if not alternatives:
+                return ReservationReport(ok=False, conflicts=[ConflictRange(old.experiment_id, old.stage_index, new_start, new_end, new_end, candidate_nodes[0], RESOURCE_SHORTAGE, message="adjustment has no feasible node")])
+            feasible_node = alternatives[0]
+        released = self.reservations.cancel(reservation_id, "adjusted")
+        new_id = f"{reservation_id}-r{len(self.reservations.to_list()) + 1}"
+        item = Reservation(new_id, old.experiment_id, old.stage_index, feasible_node, new_start, new_end, demand, replaces=reservation_id)
+        self.reservations.add(item)
+        self._bind_queue_reservation(item)
+        return ReservationReport(ok=True, reservations=[item], released_capacity=[released] if released else [])
+
+    def _window_available_without(self, node_id: str, demand: dict[str, int], start: int, end: int, exclude_id: str) -> bool:
+        node = self.cluster.nodes[node_id]
+        if any(start < outage_end and outage_start < end for outage_start, outage_end in self.outages.get(node_id, [])):
+            return False
+        for time in range(start, end):
+            used = {name: 0 for name in node.resource_capacity}
+            for item in self.reservations.active_promises(include_breached=True):
+                if item.node_id == node_id and item.start <= time < item.end and item.reservation_id != exclude_id:
+                    for name, amount in item.demand.items():
+                        used[name] = used.get(name, 0) + amount
+            if any(used.get(name, 0) + amount > node.resource_capacity.get(name, 0) for name, amount in demand.items()):
+                return False
+        return True
+
+    def reservation_capacity_view(self, time: Optional[int] = None) -> dict[str, dict[str, dict[str, int]]]:
+        time = self.now if time is None else time
+        view = {}
+        for node_id, node in self.cluster.nodes.items():
+            promised = {name: 0 for name in node.resource_capacity}
+            actual = {name: 0 for name in node.resource_capacity}
+            if self.now <= time:
+                for eid, demand in self.cluster.runtime_for(node_id).allocations.items():
+                    end_times = [t for t, _, (kind, other) in self._heap if kind in ("stage_end", "fail") and other == eid and t > time]
+                    if end_times:
+                        for name, amount in demand.items():
+                            actual[name] += amount
+            for item in self.reservations.active_promises(include_breached=True):
+                if item.node_id == node_id and item.start <= time < item.end:
+                    for name, amount in item.demand.items():
+                        promised[name] += amount
+            capacity = node.resource_capacity
+            view[node_id] = {
+                "capacity": dict(capacity),
+                "actual": actual,
+                "promised": promised,
+                "available": {name: capacity[name] - actual[name] - promised[name] for name in capacity},
+            }
+        return view
+
+    def evaluate_reservation_change(
+        self,
+        *,
+        cancel_ids: Optional[list[str]] = None,
+        adjustments: Optional[dict[str, tuple[int, int]]] = None,
+        end_time: Optional[int] = None,
+    ) -> dict:
+        """在临时副本上评估取消/调整，返回终态、启动时间和等待原因对比。"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
+            state_path = Path(handle.name)
+        try:
+            self.save_state(state_path)
+            baseline = Scheduler.load_state(state_path)
+            baseline.run_until(end_time=end_time)
+            before = {
+                "statuses": {eid: rec.status.value for eid, rec in baseline.records.items()},
+                "start_times": {eid: rec.start_time for eid, rec in baseline.records.items()},
+                "end_times": {eid: rec.end_time for eid, rec in baseline.records.items()},
+                "waiting_reasons": dict(baseline.last_blockages),
+            }
+            scenario = Scheduler.load_state(state_path)
+            released: list[str] = []
+            for reservation_id in cancel_ids or []:
+                report = scenario.cancel_reservation(reservation_id, "what_if_cancel")
+                if report.ok:
+                    released.append(reservation_id)
+            for reservation_id, (new_start, new_end) in (adjustments or {}).items():
+                report = scenario.adjust_reservation(reservation_id, new_start, new_end)
+                if not report.ok:
+                    return {
+                        "ok": False,
+                        "reservation_id": reservation_id,
+                        "conflicts": [c.to_dict() for c in report.conflicts],
+                    }
+            scenario.run_until(end_time=end_time)
+            return {
+                "ok": True,
+                "released": released,
+                "before": before,
+                "after": {
+                    "statuses": {eid: rec.status.value for eid, rec in scenario.records.items()},
+                    "start_times": {eid: rec.start_time for eid, rec in scenario.records.items()},
+                    "end_times": {eid: rec.end_time for eid, rec in scenario.records.items()},
+                    "waiting_reasons": dict(scenario.last_blockages),
+                },
+            }
+        finally:
+            state_path.unlink(missing_ok=True)
+
+    def _cancel_future_reservations(self, experiment_id: str, completed_stage: int, reason: str) -> None:
+        for item in self.reservations.list(ReservationStatus.CONFIRMED):
+            if item.experiment_id == experiment_id and item.stage_index >= completed_stage:
+                self.reservations.cancel(item.reservation_id, reason)
+
     # ---- 外部干预：取消 / 注入失败 --------------------------------------
 
     def request_cancel(self, eid: str, at_time: int) -> None:
@@ -554,6 +1000,15 @@ class Scheduler:
             raise ValueError("不能在过去的时间注入失败")
         fire = at_time if at_time > self.now else self.now + 1
         self._push(fire, ("fail", eid), key=eid)
+
+    def request_early_finish(self, eid: str, at_time: int) -> None:
+        if at_time < self.now:
+            raise ValueError("不能在过去的时间标记提前结束")
+        fire = at_time if at_time > self.now else self.now + 1
+        record = self.records.get(eid)
+        if record is not None and record.status is RunStatus.RUNNING:
+            self._remove_existing_stage_end(eid)
+        self._push(fire, ("early_finish", eid), key=eid)
 
     # ---- 事件堆 ---------------------------------------------------------
 
@@ -623,6 +1078,7 @@ class Scheduler:
                 {"victim": victim, "requester": requester}
                 for victim, requester in sorted(self._yield_requested.items())
             ],
+            "reservations": self.reservations.to_list(),
             "event_for": {k: list(v) for k, v in self._event_for.items()},
         }
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -684,6 +1140,18 @@ class Scheduler:
                         req.stage_list[record.stage_index].resource_request,
                     )
         scheduler.pending_arrivals = set(data.get("pending_arrivals", []))
+        scheduler.reservations.load_list(data.get("reservations", []))
+        for entry in scheduler.queue.pending:
+            reservation = scheduler.reservations.confirmed_for(
+                entry.experiment_id,
+                entry.stage_index,
+                at_time=scheduler.now,
+            )
+            if reservation is not None:
+                entry.reservation_id = reservation.reservation_id
+                entry.pinned_node_id = reservation.node_id
+                entry.reserved_start = reservation.start
+                entry.deadline = reservation.end
         scheduler.last_blockages = dict(data.get("last_blockages", {}))
         raw_yield = data.get("yield_requested", [])
         scheduler._yield_requested = {
