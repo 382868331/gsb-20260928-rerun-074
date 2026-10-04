@@ -164,12 +164,19 @@ class Scheduler:
             if not self._heap and not self.queue:
                 schedule_once()
                 break
+            next_reserved = self._next_reserved_start()
             if not self._heap:
                 schedule_once()
-                # 队列非空但无事件：安全前进一步，避免死循环
-                self.now += 1
+                if next_reserved is not None and next_reserved > self.now:
+                    # 预约窗口是未来确定的唤醒点，直接跳到该时刻
+                    self.now = next_reserved
+                else:
+                    # 队列非空但无事件：安全前进一步，避免死循环
+                    self.now += 1
                 continue
             fire_time = self._heap[0][0]
+            if next_reserved is not None:
+                fire_time = min(fire_time, next_reserved)
             if end_time is not None:
                 fire_time = min(fire_time, end_time)
             if fire_time > self.now:
@@ -181,6 +188,15 @@ class Scheduler:
             schedule_once()
         result.now = self.now
         return result
+
+    def _next_reserved_start(self) -> Optional[int]:
+        """排队任务中最近的未来预约开始时刻；没有则 None。"""
+        starts = [
+            entry.reserved_start
+            for entry in self.queue.pending
+            if entry.reserved_start is not None and entry.reserved_start > self.now
+        ]
+        return min(starts) if starts else None
 
     def _process_events_at(self, time: int, result: SimulationResult) -> None:
         due: list[tuple] = []

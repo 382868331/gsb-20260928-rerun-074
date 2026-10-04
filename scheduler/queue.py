@@ -140,6 +140,7 @@ class FairQueuePolicy:
                     entry.demand,
                     now,
                     states[node_id],
+                    duration=entry.duration,
                     exact_time=exact_time,
                     deadline=entry.deadline,
                     current_reservation_id=entry.reservation_id,

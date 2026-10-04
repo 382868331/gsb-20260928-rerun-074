@@ -130,3 +130,80 @@ def test_evaluate_reservation_change_is_readonly():
     assert result["ok"] is True
     assert result["after"]["statuses"]["a"] == "completed"
     assert scheduler.reservations.get(reservation.reservation_id).status is ReservationStatus.CONFIRMED
+
+
+def _run_protected_window_scenario(resume_path=None):
+    scheduler = Scheduler([Node("n1", 100, 4, capacities={"gpu": 1})])
+    scheduler.submit(ExperimentRequest("reserved", 70, 3))
+    reservation = scheduler.reserve_deadline("reserved", 10, earliest_start=7).reservations[0]
+    scheduler.submit(ExperimentRequest("big", 70, 12))
+    scheduler.submit(ExperimentRequest(
+        "gpu_only", 10, 2,
+        stages=(Stage(10, 2, resources={"gpu": 1}),),
+    ))
+    scheduler.run_until(end_time=0)
+    assert scheduler.records["big"].status is RunStatus.PENDING
+    assert scheduler.last_blockages["big"] == "resource_shortage"
+    assert scheduler.records["gpu_only"].status is RunStatus.RUNNING
+    if resume_path is not None:
+        scheduler.save_state(resume_path)
+        scheduler = Scheduler.load_state(resume_path)
+    scheduler.run_until()
+    return scheduler, reservation
+
+
+def test_start_eligibility_protects_full_reserved_window():
+    scheduler, reservation = _run_protected_window_scenario()
+    assert scheduler.records["reserved"].start_time == 7
+    assert scheduler.records["reserved"].end_time == 10
+    assert scheduler.records["big"].start_time == 10
+    assert scheduler.records["big"].end_time == 22
+    assert scheduler.records["gpu_only"].start_time == 0
+    assert scheduler.reservations.get(reservation.reservation_id).status is ReservationStatus.CONSUMED
+    for time in range(0, 23):
+        view = scheduler.reservation_capacity_view(time)["n1"]
+        assert all(amount >= 0 for amount in view["available"].values()), time
+
+
+def test_start_eligibility_protects_window_across_snapshot(tmp_path):
+    scheduler, reservation = _run_protected_window_scenario(resume_path=tmp_path / "state.json")
+    assert scheduler.records["reserved"].start_time == 7
+    assert scheduler.records["big"].start_time == 10
+    assert scheduler.records["big"].end_time == 22
+    started = [e for e in scheduler.records["big"].events if e.kind == "stage_started"]
+    assert len(started) == 1 and started[0].time == 10
+
+
+def test_interleaved_maintenance_cancel_and_adjust_timeline(tmp_path):
+    scheduler = Scheduler([Node("n1", 100, 4), Node("n2", 100, 4)])
+    scheduler.add_outage("n2", Outage(2, 6))
+    scheduler.submit(ExperimentRequest("reserved", 70, 3))
+    reservation = scheduler.reserve_deadline("reserved", 10, earliest_start=7).reservations[0]
+    scheduler.submit(ExperimentRequest("big", 70, 12))
+    scheduler.submit(ExperimentRequest("spare", 50, 2))
+    spare_res = scheduler.reserve_deadline("spare", 12, earliest_start=10).reservations[0]
+    scheduler.run_until(end_time=0)
+    assert scheduler.last_blockages["big"] == "resource_shortage"
+    path = tmp_path / "state.json"
+    scheduler.save_state(path)
+    scheduler = Scheduler.load_state(path)
+    cancel_report = scheduler.cancel_reservation(spare_res.reservation_id)
+    assert cancel_report.ok
+    assert scheduler.reservations.get(spare_res.reservation_id).status is ReservationStatus.CANCELLED
+    view = scheduler.reservation_capacity_view(11)["n1"]
+    assert view["promised"]["memory_mb"] == 0
+    adjust_report = scheduler.adjust_reservation(reservation.reservation_id, 8, 11)
+    assert adjust_report.ok
+    moved = adjust_report.reservations[0]
+    assert (moved.start, moved.end) == (8, 11)
+    scheduler.run_until()
+    assert scheduler.records["reserved"].start_time == 8
+    assert scheduler.records["reserved"].end_time == 11
+    assert scheduler.records["big"].node_id == "n2"
+    assert scheduler.records["big"].start_time == 6
+    assert scheduler.records["big"].end_time == 18
+    assert scheduler.records["spare"].status is RunStatus.COMPLETED
+    assert scheduler.reservations.get(moved.reservation_id).status is ReservationStatus.CONSUMED
+    for time in range(0, 19):
+        for node_view in scheduler.reservation_capacity_view(time).values():
+            assert all(amount >= 0 for amount in node_view["available"].values()), time
