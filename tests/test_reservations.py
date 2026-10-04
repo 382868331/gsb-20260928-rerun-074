@@ -130,3 +130,100 @@ def test_evaluate_reservation_change_is_readonly():
     assert result["ok"] is True
     assert result["after"]["statuses"]["a"] == "completed"
     assert scheduler.reservations.get(reservation.reservation_id).status is ReservationStatus.CONFIRMED
+
+
+def test_future_reservation_protects_full_execution_interval():
+    # 容量100，7-10已承诺70；70x12的任务不能只因0时刻空闲就启动
+    scheduler = Scheduler([Node("n1", 100, 4)])
+    scheduler.submit(ExperimentRequest("reserved", 70, 3))
+    report = scheduler.reserve_deadline("reserved", 10, earliest_start=7)
+    assert report.ok
+    scheduler.submit(ExperimentRequest("long", 70, 12))
+    scheduler.run_until(end_time=0)
+    assert scheduler.records["long"].status is RunStatus.PENDING
+    assert scheduler.last_blockages["long"] == "reservation_conflict"
+    scheduler.run_until(end_time=7)
+    assert scheduler.records["reserved"].status is RunStatus.RUNNING
+    assert scheduler.records["long"].status is RunStatus.PENDING
+    assert scheduler.last_blockages["long"] == "reservation_conflict"
+    scheduler.run_until()
+    assert scheduler.records["reserved"].start_time == 7
+    assert scheduler.records["reserved"].end_time == 10
+    assert scheduler.records["long"].start_time == 10
+    assert scheduler.records["long"].end_time == 22
+
+
+def test_disjoint_stage_resources_do_not_overblock():
+    # 预约只承诺 gpu；纯内存长任务与后续纯内存阶段不应被它阻塞
+    scheduler = Scheduler([Node("n1", 100, 4, capacities={"gpu": 1})])
+    scheduler.submit(ExperimentRequest("gpujob", 10, 2, stages=(Stage(10, 2, resources={"gpu": 1}),)))
+    report = scheduler.reserve_deadline("gpujob", 8, earliest_start=4)
+    assert report.ok
+    scheduler.submit(ExperimentRequest("memjob", 60, 10))
+    scheduler.submit(ExperimentRequest(
+        "multi", 10, 4,
+        stages=(Stage(10, 2, resources={"gpu": 1}), Stage(50, 2)),
+    ))
+    scheduler.run_until(end_time=0)
+    assert scheduler.records["memjob"].status is RunStatus.RUNNING
+    assert scheduler.records["multi"].status is RunStatus.RUNNING
+    scheduler.run_until()
+    assert scheduler.records["memjob"].start_time == 0
+    assert scheduler.records["multi"].start_time == 0
+    assert scheduler.records["gpujob"].start_time == 4
+    assert scheduler.records["gpujob"].end_time == 6
+    # multi 的纯内存阶段等 memjob 释放内存后接续，与 gpu 预约无关
+    assert scheduler.records["multi"].end_time == 12
+
+
+def test_interleaved_maintenance_adjust_cancel_and_snapshot(tmp_path):
+    scheduler = Scheduler([Node("n1", 100, 4, capacities={"gpu": 1})])
+    scheduler.submit(ExperimentRequest(
+        "multi", 10, 4,
+        stages=(Stage(10, 2, resources={"gpu": 1}), Stage(60, 2)),
+    ))
+    report = scheduler.reserve_deadline("multi", 12, earliest_start=2)
+    assert report.ok
+    first, second = report.reservations
+    assert (first.start, first.end) == (2, 4)
+    assert (second.start, second.end) == (4, 6)
+    # 维护窗口与阶段0预约重叠 -> 预约保留为 breached 并记录区间
+    scheduler.add_outage("n1", Outage(2, 4))
+    stored = scheduler.reservations.get(first.reservation_id)
+    assert stored.status is ReservationStatus.BREACHED
+    assert "maintenance=[2,4)" in stored.breach_reason
+    # 调整阶段0预约到维护之后，旧承诺取消、生成新 ID
+    adjusted = scheduler.adjust_reservation(first.reservation_id, 4, 6)
+    assert adjusted.ok
+    new_first = adjusted.reservations[0]
+    assert new_first.replaces == first.reservation_id
+    assert scheduler.reservations.get(first.reservation_id).status is ReservationStatus.CANCELLED
+    # 取消阶段1尚未执行的预约 -> 承诺立即释放
+    cancel = scheduler.cancel_reservation(second.reservation_id)
+    assert cancel.ok
+    view = scheduler.reservation_capacity_view(5)
+    assert view["n1"]["promised"]["memory_mb"] == 10
+    assert view["n1"]["promised"]["gpu"] == 1
+    # 纯内存补充任务与承诺不相交，在维护前立即启动并完成
+    scheduler.submit(ExperimentRequest("filler", 40, 1))
+    scheduler.run_until(end_time=0)
+    assert scheduler.records["filler"].status is RunStatus.RUNNING
+    # 维护中途保存重开，预约与事件流水完整恢复
+    scheduler.run_until(end_time=3)
+    path = tmp_path / "state.json"
+    scheduler.save_state(path)
+    resumed = Scheduler.load_state(path)
+    assert resumed.reservations.get(new_first.reservation_id).status is ReservationStatus.CONFIRMED
+    resumed.run_until(end_time=5)
+    assert resumed.records["multi"].status is RunStatus.RUNNING
+    assert resumed.records["multi"].start_time == 4
+    view = resumed.reservation_capacity_view()
+    assert view["n1"]["actual"]["gpu"] == 1
+    assert view["n1"]["promised"]["gpu"] == 0
+    resumed.run_until()
+    # 账目核对：阶段0消费预约 4-6，阶段1 接续到 8，filler 维护前已完成
+    assert resumed.records["multi"].end_time == 8
+    assert resumed.records["filler"].end_time == 1
+    assert resumed.reservations.get(new_first.reservation_id).status is ReservationStatus.CONSUMED
+    started = [e for e in resumed.records["multi"].events if e.kind == "stage_started"]
+    assert len(started) == 2

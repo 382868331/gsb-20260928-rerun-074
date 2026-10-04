@@ -126,6 +126,7 @@ class FairQueuePolicy:
         targets: dict[str, Target] = {}
         blockages: list[Blockage] = []
         budget = schedule_budget
+        reservation_ids = {item.reservation_id for item in reservations}
         for entry in self.ordered(now):
             self._current_reservation_id = entry.reservation_id
             if budget is not None and budget <= 0:
@@ -140,6 +141,7 @@ class FairQueuePolicy:
                     entry.demand,
                     now,
                     states[node_id],
+                    duration=entry.duration,
                     exact_time=exact_time,
                     deadline=entry.deadline,
                     current_reservation_id=entry.reservation_id,
@@ -176,9 +178,18 @@ class FairQueuePolicy:
                         for name, amount in entry.demand.items()
                     )
                 )
+                reason = RESOURCE_SHORTAGE
+                if maintenance_delayed:
+                    reason = MAINTENANCE
+                elif (
+                    entry.reservation_id is None
+                    and reservation_ids
+                    and FairQueuePolicy._fits_now_without(chosen_state, entry, now, reservation_ids)
+                ):
+                    reason = RESERVATION_CONFLICT
                 blockages.append(Blockage(
                     entry.experiment_id,
-                    MAINTENANCE if maintenance_delayed else RESOURCE_SHORTAGE,
+                    reason,
                     f"earliest_start={start} node={node_id}",
                 ))
             if entry.deadline is not None and start + entry.duration > entry.deadline:
@@ -200,6 +211,22 @@ class FairQueuePolicy:
                 budget -= 1
         self._current_reservation_id = None
         return targets, blockages
+
+    @staticmethod
+    def _fits_now_without(state, entry, now: int, reservation_ids: set) -> bool:
+        """剔除他人预约事件后此刻即可启动：说明延迟完全由未来预约造成。"""
+        filtered = dict(state)
+        filtered["events"] = [
+            item for item in state["events"]
+            if item[2] not in reservation_ids
+        ]
+        start = FairQueuePolicy._earliest_start(
+            entry.demand,
+            now,
+            filtered,
+            duration=entry.duration,
+        )
+        return start == now
 
     @staticmethod
     def _cluster_has_capacity(cluster, demand: dict[str, int]) -> bool:

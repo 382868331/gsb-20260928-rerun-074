@@ -166,10 +166,14 @@ class Scheduler:
                 break
             if not self._heap:
                 schedule_once()
-                # 队列非空但无事件：安全前进一步，避免死循环
-                self.now += 1
+                # 队列非空但无事件：跳到下一个预约开启时刻，否则安全前进一步
+                open_time = self._next_reservation_open_time()
+                self.now = open_time if open_time is not None else self.now + 1
                 continue
             fire_time = self._heap[0][0]
+            open_time = self._next_reservation_open_time()
+            if open_time is not None:
+                fire_time = min(fire_time, open_time)
             if end_time is not None:
                 fire_time = min(fire_time, end_time)
             if fire_time > self.now:
@@ -181,6 +185,15 @@ class Scheduler:
             schedule_once()
         result.now = self.now
         return result
+
+    def _next_reservation_open_time(self) -> Optional[int]:
+        """最近的未来预约开启时刻；保证时间推进不会跳过已承诺窗口。"""
+        starts = [
+            item.start
+            for item in self.reservations.active_promises()
+            if item.start > self.now
+        ]
+        return min(starts) if starts else None
 
     def _process_events_at(self, time: int, result: SimulationResult) -> None:
         due: list[tuple] = []
