@@ -96,6 +96,36 @@ add_outage(node_id, Outage(start, end))：
 - 任务提前结束或取消时，尚未消费的后续预约会取消；预约、真实执行和违约事件
   分别写入任务事件流水，快照中也会完整保存。
 
+## 到场窗口与迟到处理
+
+`reserve_deadline(..., check_in_deadline=t, expiry_policy=...)` 为预约定义可核对
+的到场窗口：预约窗口自动延长为 `宽限 + 阶段时长`，窗口内到场保证仍能装下整个
+阶段。窗口内承诺保留；窗口过后仍未启动时按研究者选择的策略处理：
+
+- `ExpiryPolicy.RELEASE`（默认）：到期释放剩余承诺容量，记 `reservation_expired`；
+  容量被其他任务拿走后，迟到任务只能普通排队，不能自动夺回。
+- `ExpiryPolicy.HOLD`：到期仍保留承诺（容量宁可闲置也不给别人），记
+  `reservation_hold_expired`；迟到到无法装进窗口时按违约处理。
+- `notify_arrival(experiment_id)` 核对到场并写入 `arrival_notified`；重复通知
+  幂等（返回 `duplicate=True`，不重复记事件），已核对到场的预约不按 no_show
+  过期。快照会保存已核对记录，恢复后重复通知仍幂等。
+
+## 多阶段延迟传播：三方案对比
+
+`request_delay(eid, extra)` 把运行中阶段的完成时刻后移，模拟前一阶段延迟。
+`evaluate_delay_strategies(experiment_id, delay)` 在快照副本上比较三种后续
+预约处理方案，不修改当前模拟：
+
+- `keep`：保留后续预约，被延迟错过的窗口记 `breached`；
+- `cancel_affected`：只撤销被延迟传播波及的阶段预约，未受影响的保留；
+- `reapply`：撤销本实验全部后续预约并按原期限重新申请；找不到不侵入其他
+  实验已确认窗口的容量时逐段返回冲突，绝不悄悄挪动别人的预约。
+
+每个方案逐段列出承诺窗口、实际启动/结束、实际等待与资源冲突，并校验其他
+实验的预约窗口保持不变（`others_windows_unchanged`）。临近到期保存快照再
+恢复后，重复到场通知、延迟完成与维护调整产生的承诺与实际占用记录与不
+中断运行一致。
+
 ## 状态保存与接续模拟
 
 Scheduler.save_state(path) 保存时钟、节点、命名资源占用、维护窗口、调度预算、
@@ -107,4 +137,5 @@ stage_started 只出现一次，迁移续跑记录为 stage_resumed，资源最�
 ## 运行
     .venv/bin/python examples/demo.py
     .venv/bin/python examples/multistage_demo.py
+    .venv/bin/python examples/arrival_window_demo.py
     .venv/bin/python -m pytest -q

@@ -15,6 +15,13 @@ class ReservationStatus(str, Enum):
     BREACHED = "breached"
 
 
+class ExpiryPolicy(str, Enum):
+    """到场窗口到期后的处理方式，由研究者选择。"""
+
+    HOLD = "hold"
+    RELEASE = "release"
+
+
 @dataclass
 class Reservation:
     reservation_id: str
@@ -27,6 +34,15 @@ class Reservation:
     status: ReservationStatus = ReservationStatus.CONFIRMED
     breach_reason: str = ""
     replaces: Optional[str] = None
+    check_in_deadline: Optional[int] = None
+    expiry_policy: ExpiryPolicy = ExpiryPolicy.RELEASE
+    expired: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.expiry_policy, str):
+            self.expiry_policy = ExpiryPolicy(self.expiry_policy)
+        if self.check_in_deadline is not None and self.check_in_deadline < self.start:
+            self.check_in_deadline = self.start
 
     def overlaps(self, start: int, end: int) -> bool:
         return self.start < end and start < self.end
@@ -43,6 +59,9 @@ class Reservation:
             "status": self.status.value,
             "breach_reason": self.breach_reason,
             "replaces": self.replaces,
+            "check_in_deadline": self.check_in_deadline,
+            "expiry_policy": self.expiry_policy.value,
+            "expired": self.expired,
         }
 
     @classmethod
@@ -58,7 +77,25 @@ class Reservation:
             status=ReservationStatus(data.get("status", ReservationStatus.CONFIRMED.value)),
             breach_reason=data.get("breach_reason", ""),
             replaces=data.get("replaces"),
+            check_in_deadline=data.get("check_in_deadline"),
+            expiry_policy=ExpiryPolicy(data.get("expiry_policy", ExpiryPolicy.RELEASE.value)),
+            expired=data.get("expired", False),
         )
+
+
+@dataclass
+class ArrivalReport:
+    """一次到场通知的核对结果。"""
+
+    ok: bool
+    experiment_id: str
+    stage_index: int
+    reservation_id: Optional[str] = None
+    duplicate: bool = False
+    within_window: bool = False
+    late: bool = False
+    expiry_policy: str = ExpiryPolicy.RELEASE.value
+    message: str = ""
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,7 @@ from .reservations import (
     ReservationReport,
     ReservationStatus,
 )
+from .reservations import ArrivalReport, ExpiryPolicy
 
 __all__ = [
     "Node",
@@ -41,4 +42,6 @@ __all__ = [
     "ReservationLedger",
     "ReservationReport",
     "ReservationStatus",
+    "ArrivalReport",
+    "ExpiryPolicy",
 ]

@@ -27,6 +27,7 @@ from .reservations import (
     ReservationReport,
     ReservationStatus,
 )
+from .reservations import ArrivalReport, ExpiryPolicy
 
 
 class CapacityInfeasibleError(RuntimeError):
@@ -67,6 +68,7 @@ class Scheduler:
         self.outages: dict[str, list[tuple[int, int]]] = {node.node_id: [] for node in nodes}
         self.last_blockages: dict[str, str] = {}
         self.reservations = ReservationLedger()
+        self._arrivals: set[tuple[str, int]] = set()
 
     # ---- 提交与容量校验 -------------------------------------------------
 
@@ -104,7 +106,6 @@ class Scheduler:
         reservation = self.reservations.confirmed_for(
             request.experiment_id,
             stage_index,
-            at_time=self.now,
         )
         entry = QueueEntry(
                 experiment_id=request.experiment_id,
@@ -173,6 +174,8 @@ class Scheduler:
                 else:
                     # 队列非空但无事件：安全前进一步，避免死循环
                     self.now += 1
+                if end_time is not None and self.now > end_time:
+                    self.now = end_time
                 continue
             fire_time = self._heap[0][0]
             if next_reserved is not None:
@@ -196,6 +199,16 @@ class Scheduler:
             for entry in self.queue.pending
             if entry.reserved_start is not None and entry.reserved_start > self.now
         ]
+        for item in self.reservations.list(ReservationStatus.CONFIRMED):
+            if item.start > self.now:
+                starts.append(item.start)
+            if (
+                item.check_in_deadline is not None
+                and not item.expired
+                and (item.experiment_id, item.stage_index) not in self._arrivals
+                and item.check_in_deadline + 1 > self.now
+            ):
+                starts.append(item.check_in_deadline + 1)
         return min(starts) if starts else None
 
     def _process_events_at(self, time: int, result: SimulationResult) -> None:
@@ -304,6 +317,7 @@ class Scheduler:
             return None
 
     def _reconcile_due_reservations(self) -> None:
+        self._apply_check_in_expiry()
         for entry in self.queue.pending:
             reservation = self._reservation_for_entry(entry)
             if reservation is None:
@@ -333,6 +347,38 @@ class Scheduler:
             entry.pinned_node_id = reservation.node_id
             entry.reserved_start = self.now
             entry.deadline = reservation.end
+
+    def _apply_check_in_expiry(self) -> None:
+        """到场窗口到期：按研究者选择的策略保留或释放承诺。
+
+        窗口内已核对到场（notify_arrival）的预约不会按 no_show 过期。
+        RELEASE 释放容量后，迟到任务只能普通排队，不能自动夺回已经
+        分配给其他任务的资源；HOLD 保留承诺，迟到任务仍按原窗口启动。
+        """
+        for item in self.reservations.list(ReservationStatus.CONFIRMED):
+            if item.check_in_deadline is None or item.expired:
+                continue
+            if self.now <= item.check_in_deadline:
+                continue
+            if (item.experiment_id, item.stage_index) in self._arrivals:
+                continue
+            item.expired = True
+            record = self.records.get(item.experiment_id)
+            if item.expiry_policy is ExpiryPolicy.RELEASE:
+                self.reservations.cancel(item.reservation_id, "no_show")
+                if record is not None:
+                    record.log(
+                        self.now,
+                        "reservation_expired",
+                        f"reservation={item.reservation_id} policy=release reason=no_show",
+                    )
+            else:
+                if record is not None:
+                    record.log(
+                        self.now,
+                        "reservation_hold_expired",
+                        f"reservation={item.reservation_id} policy=hold late_arrival_kept",
+                    )
 
     def _detach_entry_reservation(self, entry: QueueEntry) -> None:
         entry.pinned_node_id = None
@@ -676,6 +722,8 @@ class Scheduler:
         *,
         earliest_start: Optional[int] = None,
         reservation_id: Optional[str] = None,
+        check_in_deadline: Optional[int] = None,
+        expiry_policy: ExpiryPolicy = ExpiryPolicy.RELEASE,
     ) -> ReservationReport:
         request = self.requests[experiment_id]
         stages = request.stage_list
@@ -684,7 +732,8 @@ class Scheduler:
         start = max(self.now if earliest_start is None else earliest_start, self.now)
         reservation_id = reservation_id or f"{experiment_id}-s{stage_index}-{len(self.reservations.to_list()) + 1}"
         stage = stages[stage_index]
-        window = self._find_stage_window(experiment_id, stage_index, stage.resource_request, stage.duration, start, deadline)
+        grace = self._check_in_grace(check_in_deadline, start)
+        window = self._find_stage_window(experiment_id, stage_index, stage.resource_request, stage.duration + grace, start, deadline)
         if window is None:
             return ReservationReport(
                 ok=False,
@@ -708,6 +757,8 @@ class Scheduler:
             start=actual_start,
             end=actual_end,
             demand=dict(stage.resource_request),
+            check_in_deadline=(actual_end - stage.duration) if check_in_deadline is not None else None,
+            expiry_policy=expiry_policy,
         )
         self.reservations.add(reservation)
         self._bind_queue_reservation(reservation)
@@ -722,23 +773,30 @@ class Scheduler:
         *,
         earliest_start: Optional[int] = None,
         reservation_ids: Optional[list[str]] = None,
+        check_in_deadline: Optional[int] = None,
+        expiry_policy: ExpiryPolicy = ExpiryPolicy.RELEASE,
+        from_stage: int = 0,
     ) -> ReservationReport:
         request = self.requests[experiment_id]
         stages = request.stage_list
         if deadline < self.now:
             raise ValueError("交付期限不能早于当前时间")
+        if not 0 <= from_stage < len(stages):
+            raise IndexError("起始阶段序号超出范围")
         start = max(self.now if earliest_start is None else earliest_start, self.now)
         proposed: list[tuple[int, str, int, int]] = []
         conflicts: list[ConflictRange] = []
-        for index, stage in enumerate(stages):
+        for index in range(from_stage, len(stages)):
+            stage = stages[index]
             ids = reservation_ids or []
-            reservation_id = ids[index] if index < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
+            reservation_id = ids[index - from_stage] if index - from_stage < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
             latest_finish = deadline - sum(s.duration for s in stages[index + 1:])
+            grace = self._check_in_grace(check_in_deadline, start) if index == from_stage else 0
             window = self._find_stage_window(
                 experiment_id,
                 index,
                 stage.resource_request,
-                stage.duration,
+                stage.duration + grace,
                 start,
                 latest_finish,
                 proposed=proposed,
@@ -767,7 +825,7 @@ class Scheduler:
         items: list[Reservation] = []
         for index, node_id, actual_start, actual_end in proposed:
             ids = reservation_ids or []
-            reservation_id = ids[index] if index < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
+            reservation_id = ids[index - from_stage] if index - from_stage < len(ids) else f"{experiment_id}-s{index}-{len(self.reservations.to_list()) + index + 1}"
             stage = stages[index]
             item = Reservation(
                 reservation_id=reservation_id,
@@ -777,12 +835,23 @@ class Scheduler:
                 start=actual_start,
                 end=actual_end,
                 demand=dict(stage.resource_request),
+                check_in_deadline=(actual_end - stage.duration) if (check_in_deadline is not None and index == from_stage) else None,
+                expiry_policy=expiry_policy,
             )
             self.reservations.add(item)
             self._bind_queue_reservation(item)
             items.append(item)
         self.records[experiment_id].log(items[0].start, "reservation_deadline_confirmed", f"deadline={deadline} reservations={','.join(i.reservation_id for i in items)}")
         return ReservationReport(ok=True, reservations=items)
+
+    @staticmethod
+    def _check_in_grace(check_in_deadline: Optional[int], start: int) -> int:
+        """到场宽限：预约窗口 = 宽限 + 阶段时长，窗口内到场保证可执行。"""
+        if check_in_deadline is None:
+            return 0
+        if check_in_deadline < start:
+            raise ValueError("到场窗口截止时间不能早于可开始时间")
+        return check_in_deadline - start
 
     def _reservation_blocker(
         self,
@@ -905,7 +974,21 @@ class Scheduler:
             feasible_node = alternatives[0]
         released = self.reservations.cancel(reservation_id, "adjusted")
         new_id = f"{reservation_id}-r{len(self.reservations.to_list()) + 1}"
-        item = Reservation(new_id, old.experiment_id, old.stage_index, feasible_node, new_start, new_end, demand, replaces=reservation_id)
+        grace = None
+        if old.check_in_deadline is not None:
+            grace = new_start + max(0, old.check_in_deadline - old.start)
+        item = Reservation(
+            new_id,
+            old.experiment_id,
+            old.stage_index,
+            feasible_node,
+            new_start,
+            new_end,
+            demand,
+            replaces=reservation_id,
+            check_in_deadline=grace,
+            expiry_policy=old.expiry_policy,
+        )
         self.reservations.add(item)
         self._bind_queue_reservation(item)
         return ReservationReport(ok=True, reservations=[item], released_capacity=[released] if released else [])
@@ -1004,6 +1087,201 @@ class Scheduler:
             if item.experiment_id == experiment_id and item.stage_index >= completed_stage:
                 self.reservations.cancel(item.reservation_id, reason)
 
+    # ---- 到场窗口与迟到 -------------------------------------------------
+
+    def notify_arrival(self, experiment_id: str, stage_index: Optional[int] = None) -> ArrivalReport:
+        """核对到场：窗口内到场保留承诺，重复通知幂等。
+
+        已核对到场的预约不会按 no_show 过期；迟到且策略为 RELEASE 的预约
+        已被释放时返回 ok=False，任务只能普通排队。
+        """
+        record = self.records.get(experiment_id)
+        if record is None:
+            raise KeyError(f"未知实验 {experiment_id}")
+        stage_index = record.stage_index if stage_index is None else stage_index
+        key = (experiment_id, stage_index)
+        reservation = self.reservations.confirmed_for(experiment_id, stage_index)
+        if key in self._arrivals:
+            return ArrivalReport(
+                ok=True,
+                experiment_id=experiment_id,
+                stage_index=stage_index,
+                reservation_id=reservation.reservation_id if reservation else None,
+                duplicate=True,
+                within_window=True,
+                expiry_policy=reservation.expiry_policy.value if reservation else ExpiryPolicy.RELEASE.value,
+                message="arrival already recorded",
+            )
+        self._arrivals.add(key)
+        if reservation is None:
+            record.log(self.now, "arrival_notified", f"stage={stage_index} no_confirmed_reservation")
+            return ArrivalReport(
+                ok=False,
+                experiment_id=experiment_id,
+                stage_index=stage_index,
+                message="no confirmed reservation; check-in recorded without promise",
+            )
+        deadline = reservation.check_in_deadline
+        effective = deadline if deadline is not None else reservation.end
+        late = self.now > effective
+        record.log(
+            self.now,
+            "arrival_notified",
+            f"stage={stage_index} reservation={reservation.reservation_id} late={late}",
+        )
+        return ArrivalReport(
+            ok=True,
+            experiment_id=experiment_id,
+            stage_index=stage_index,
+            reservation_id=reservation.reservation_id,
+            within_window=not late,
+            late=late,
+            expiry_policy=reservation.expiry_policy.value,
+            message="late arrival; promise kept by hold policy" if late else "within check-in window",
+        )
+
+    def request_delay(self, eid: str, extra_time: int) -> None:
+        """延迟完成：把运行中阶段的结束事件后移 extra_time 个时间单位。"""
+        if extra_time <= 0:
+            raise ValueError("延迟时长必须为正数")
+        record = self.records.get(eid)
+        if record is None or record.status is not RunStatus.RUNNING:
+            raise ValueError("只有运行中的阶段可以延迟完成")
+        handle = self._event_for.get(eid)
+        if handle is None:
+            raise RuntimeError(f"实验 {eid} 缺少阶段结束事件")
+        old_end = handle[0]
+        self._remove_existing_stage_end(eid)
+        record.stage_remaining = (record.stage_remaining or 0) + extra_time
+        self._push(old_end + extra_time, ("stage_end", eid), key=eid)
+        record.log(self.now, "stage_delayed", f"stage={record.stage_index} extra={extra_time} new_end={old_end + extra_time}")
+
+    # ---- 多阶段延迟传播：三方案对比 --------------------------------------
+
+    def evaluate_delay_strategies(self, experiment_id: str, delay: int, end_time: Optional[int] = None) -> dict:
+        """前一阶段延迟 delay 个单位时，比较三种后续预约处理方案。
+
+        在快照副本上评估，不修改当前模拟；重新申请只会寻找不侵入其他
+        实验已确认窗口的容量，不会悄悄挪动别人的预约。
+        """
+        if delay <= 0:
+            raise ValueError("延迟时长必须为正数")
+        record = self.records.get(experiment_id)
+        if record is None or record.status is not RunStatus.RUNNING:
+            raise ValueError("延迟注入要求实验正在运行前一阶段")
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
+            state_path = Path(handle.name)
+        try:
+            self.save_state(state_path)
+            others_before = {
+                item.reservation_id: (item.start, item.end, item.node_id)
+                for item in self.reservations.list()
+                if item.experiment_id != experiment_id
+            }
+            strategies: dict[str, dict] = {}
+            for strategy in ("keep", "cancel_affected", "reapply"):
+                scenario = Scheduler.load_state(state_path)
+                scenario.request_delay(experiment_id, delay)
+                delayed_finish = scenario._event_for[experiment_id][0]
+                conflicts: list[dict] = []
+                if strategy == "cancel_affected":
+                    scenario._cancel_affected_reservations(experiment_id, delayed_finish)
+                elif strategy == "reapply":
+                    conflicts = scenario._reapply_reservations(experiment_id, delayed_finish)
+                scenario.run_until(end_time=end_time)
+                others_after = {
+                    item.reservation_id: (item.start, item.end, item.node_id)
+                    for item in scenario.reservations.list()
+                    if item.experiment_id != experiment_id
+                }
+                report = scenario._delay_strategy_report(experiment_id, conflicts)
+                report["others_windows_unchanged"] = others_after == others_before
+                strategies[strategy] = report
+            return {"ok": True, "experiment_id": experiment_id, "delay": delay, "strategies": strategies}
+        finally:
+            state_path.unlink(missing_ok=True)
+
+    def _cancel_affected_reservations(self, experiment_id: str, earliest: int) -> None:
+        """只撤销被延迟传播波及的后续阶段预约，未受影响的保留。"""
+        record = self.records[experiment_id]
+        stages = self.requests[experiment_id].stage_list
+        expected = earliest
+        for item in self.reservations.list(ReservationStatus.CONFIRMED):
+            if item.experiment_id != experiment_id or item.stage_index <= record.stage_index:
+                continue
+            if item.start < expected:
+                self.cancel_reservation(item.reservation_id, "delay_propagation")
+                expected = expected + stages[item.stage_index].duration
+            else:
+                expected = item.end
+
+    def _reapply_reservations(self, experiment_id: str, earliest: int) -> list[dict]:
+        """撤销本实验全部后续预约并按原交付期限重新申请。"""
+        record = self.records[experiment_id]
+        future = [
+            item for item in self.reservations.list(ReservationStatus.CONFIRMED)
+            if item.experiment_id == experiment_id and item.stage_index > record.stage_index
+        ]
+        if not future:
+            return []
+        deadline = max(item.end for item in future)
+        for item in future:
+            self.cancel_reservation(item.reservation_id, "reapply")
+        report = self.reserve_deadline(
+            experiment_id,
+            deadline,
+            earliest_start=earliest,
+            from_stage=record.stage_index + 1,
+        )
+        return [conflict.to_dict() for conflict in report.conflicts]
+
+    def _delay_strategy_report(self, experiment_id: str, conflicts: list[dict]) -> dict:
+        """逐段列出承诺窗口、实际启动/结束、等待与冲突。"""
+        record = self.records[experiment_id]
+        stages = self.requests[experiment_id].stage_list
+        per_stage: list[dict] = []
+        previous_end = record.submit_time
+        for index in range(len(stages)):
+            candidates = [
+                item for item in self.reservations.list()
+                if item.experiment_id == experiment_id and item.stage_index == index
+            ]
+            active = [
+                item for item in candidates
+                if item.status in (ReservationStatus.CONFIRMED, ReservationStatus.CONSUMED)
+            ]
+            chosen = active[-1] if active else (candidates[-1] if candidates else None)
+            actual_start = next(
+                (event.time for event in record.events
+                 if event.kind == "stage_started" and event.detail.split()[0] == f"stage={index}"),
+                None,
+            )
+            actual_end = next(
+                (event.time for event in record.events
+                 if event.kind == "stage_completed" and event.detail.split()[0] == f"stage={index}"),
+                None,
+            )
+            ready_at = chosen.start if chosen is not None else previous_end
+            per_stage.append({
+                "stage_index": index,
+                "reservation_id": chosen.reservation_id if chosen else None,
+                "reservation_status": chosen.status.value if chosen else None,
+                "promised": [chosen.start, chosen.end] if chosen else None,
+                "actual_start": actual_start,
+                "actual_end": actual_end,
+                "wait": (actual_start - ready_at) if actual_start is not None else None,
+                "conflicts": [c for c in conflicts if c.get("stage_index") == index],
+            })
+            if actual_end is not None:
+                previous_end = actual_end
+        return {
+            "stages": per_stage,
+            "experiment_status": record.status.value,
+            "waiting_reasons": dict(self.last_blockages),
+            "conflicts": list(conflicts),
+        }
+
     # ---- 外部干预：取消 / 注入失败 --------------------------------------
 
     def request_cancel(self, eid: str, at_time: int) -> None:
@@ -1096,6 +1374,10 @@ class Scheduler:
             ],
             "reservations": self.reservations.to_list(),
             "event_for": {k: list(v) for k, v in self._event_for.items()},
+            "arrivals": [
+                {"experiment_id": eid, "stage_index": stage_index}
+                for eid, stage_index in sorted(self._arrivals)
+            ],
         }
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1157,11 +1439,11 @@ class Scheduler:
                     )
         scheduler.pending_arrivals = set(data.get("pending_arrivals", []))
         scheduler.reservations.load_list(data.get("reservations", []))
+        scheduler._load_arrivals(data)
         for entry in scheduler.queue.pending:
             reservation = scheduler.reservations.confirmed_for(
                 entry.experiment_id,
                 entry.stage_index,
-                at_time=scheduler.now,
             )
             if reservation is not None:
                 entry.reservation_id = reservation.reservation_id
@@ -1179,5 +1461,14 @@ class Scheduler:
                 (raw["time"], raw["seq"], (raw["payload_kind"], raw["experiment_id"])),
             )
         scheduler._counter = itertools.count(data.get("counter", -1) + 1)
+        scheduler._event_for = {
+            key: tuple(value) for key, value in data.get("event_for", {}).items()
+        }
         scheduler._refresh_runtime_availability()
         return scheduler
+
+    def _load_arrivals(self, data: dict) -> None:
+        self._arrivals = {
+            (item["experiment_id"], item["stage_index"])
+            for item in data.get("arrivals", [])
+        }
