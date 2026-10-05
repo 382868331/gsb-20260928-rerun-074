@@ -96,6 +96,35 @@ add_outage(node_id, Outage(start, end))：
 - 任务提前结束或取消时，尚未消费的后续预约会取消；预约、真实执行和违约事件
   分别写入任务事件流水，快照中也会完整保存。
 
+## 到场窗口与迟到处理
+
+`reserve_stage` / `reserve_deadline` 支持 `checkin_window=t` 与
+`release_on_expiry=...`，为预约定义可核对的到场窗口
+`[start, start + checkin_window]`：
+
+- 窗口内保留承诺；`notify_arrival(experiment_id)` 登记到场（幂等，重复通知
+  返回 False 且不重复写事件），实际启动也会自动视为到场。
+- 窗口过后未到场：`release_on_expiry=True` 时预约转为 `expired`，承诺容量
+  立即释放；`release_on_expiry=False` 时转为 `held`，承诺继续保留。
+- 迟到的任务在 `held` 下可在实际容量空闲时消费预约，但窗口之外不再阻断
+  他人预约，也绝不能自动夺回已经分配给其他任务的资源。
+- 台账级核对覆盖尚未入队的预约：窗口整体错过一律记 `breached`，不会静默消失。
+
+## 多阶段延迟传播与方案比较
+
+前一阶段延迟时，`affected_later_reservations(experiment_id)` 按预测就绪
+时刻列出窗口已不可达的后续预约；`evaluate_delay_strategies(experiment_id,`
+`end_time=...)` 在快照副本上比较三种方案，不修改当前模拟：
+
+- `keep`：保留后续预约（错过窗口会被记违约）；
+- `cancel_affected`：只撤销受影响阶段的预约，其余保留；
+- `rebook`：撤销受影响阶段并按预测就绪时刻重新申请（逐段列出资源冲突，
+  其他实验的已确认窗口不会被挪动）。
+
+每个方案返回各实验终态、启动/结束时间、等待原因与逐段实际等待
+（`stage_waits`）。临近到期时保存状态再恢复后，重复到场通知、延迟完成与
+维护调整产生的承诺与实际占用记录与不中断运行一致（tests/test_checkin_windows.py）。
+ ## 状态保存与接续模拟
 ## 状态保存与接续模拟
 
 Scheduler.save_state(path) 保存时钟、节点、命名资源占用、维护窗口、调度预算、

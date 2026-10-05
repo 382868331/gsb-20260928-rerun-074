@@ -9,10 +9,15 @@ from typing import Optional
 
 class ReservationStatus(str, Enum):
     CONFIRMED = "confirmed"
+    HELD = "held"
     CONSUMED = "consumed"
     CANCELLED = "cancelled"
     SUPERSEDED = "superseded"
     BREACHED = "breached"
+    EXPIRED = "expired"
+
+
+ATTACHABLE_STATUSES = (ReservationStatus.CONFIRMED, ReservationStatus.HELD)
 
 
 @dataclass
@@ -27,6 +32,9 @@ class Reservation:
     status: ReservationStatus = ReservationStatus.CONFIRMED
     breach_reason: str = ""
     replaces: Optional[str] = None
+    checkin_deadline: Optional[int] = None
+    release_on_expiry: bool = True
+    checked_in: bool = False
 
     def overlaps(self, start: int, end: int) -> bool:
         return self.start < end and start < self.end
@@ -43,6 +51,9 @@ class Reservation:
             "status": self.status.value,
             "breach_reason": self.breach_reason,
             "replaces": self.replaces,
+            "checkin_deadline": self.checkin_deadline,
+            "release_on_expiry": self.release_on_expiry,
+            "checked_in": self.checked_in,
         }
 
     @classmethod
@@ -58,6 +69,9 @@ class Reservation:
             status=ReservationStatus(data.get("status", ReservationStatus.CONFIRMED.value)),
             breach_reason=data.get("breach_reason", ""),
             replaces=data.get("replaces"),
+            checkin_deadline=data.get("checkin_deadline"),
+            release_on_expiry=data.get("release_on_expiry", True),
+            checked_in=data.get("checked_in", False),
         )
 
 
@@ -122,13 +136,13 @@ class ReservationLedger:
             item for item in self._items.values()
             if item.experiment_id == experiment_id
             and item.stage_index == stage_index
-            and item.status == ReservationStatus.CONFIRMED
-            and (at_time is None or item.start >= at_time)
+            and item.status in ATTACHABLE_STATUSES
+            and (at_time is None or item.start >= at_time or item.status is ReservationStatus.HELD)
         ]
         return min(matches, key=lambda item: item.start, default=None)
 
     def active_promises(self, include_breached: bool = False) -> list[Reservation]:
-        allowed = {ReservationStatus.CONFIRMED}
+        allowed = {ReservationStatus.CONFIRMED, ReservationStatus.HELD}
         if include_breached:
             allowed.add(ReservationStatus.BREACHED)
         return [item for item in self._items.values() if item.status in allowed]
@@ -143,15 +157,16 @@ class ReservationLedger:
 
     def consume(self, reservation_id: str) -> Optional[Reservation]:
         item = self._items.get(reservation_id)
-        if item is None or item.status != ReservationStatus.CONFIRMED:
+        if item is None or item.status not in ATTACHABLE_STATUSES:
             return None
+        item.checked_in = True
         item.status = ReservationStatus.CONSUMED
         item.breach_reason = ""
         return item
 
     def cancel(self, reservation_id: str, reason: str = "") -> Optional[Reservation]:
         item = self._items.get(reservation_id)
-        if item is None or item.status not in (ReservationStatus.CONFIRMED, ReservationStatus.BREACHED):
+        if item is None or item.status not in (*ATTACHABLE_STATUSES, ReservationStatus.BREACHED):
             return None
         item.status = ReservationStatus.CANCELLED
         item.breach_reason = reason
@@ -159,16 +174,32 @@ class ReservationLedger:
 
     def supersede(self, reservation_id: str) -> Optional[Reservation]:
         item = self._items.get(reservation_id)
-        if item is None or item.status not in (ReservationStatus.CONFIRMED, ReservationStatus.BREACHED):
+        if item is None or item.status not in (*ATTACHABLE_STATUSES, ReservationStatus.BREACHED):
             return None
         item.status = ReservationStatus.SUPERSEDED
         return item
 
     def mark_breached(self, reservation_id: str, reason: str) -> Optional[Reservation]:
         item = self._items.get(reservation_id)
-        if item is None or item.status != ReservationStatus.CONFIRMED:
+        if item is None or item.status not in ATTACHABLE_STATUSES:
             return None
         item.status = ReservationStatus.BREACHED
+        item.breach_reason = reason
+        return item
+
+    def expire(self, reservation_id: str, reason: str = "") -> Optional[Reservation]:
+        item = self._items.get(reservation_id)
+        if item is None or item.status != ReservationStatus.CONFIRMED:
+            return None
+        item.status = ReservationStatus.EXPIRED
+        item.breach_reason = reason
+        return item
+
+    def mark_held(self, reservation_id: str, reason: str = "") -> Optional[Reservation]:
+        item = self._items.get(reservation_id)
+        if item is None or item.status != ReservationStatus.CONFIRMED:
+            return None
+        item.status = ReservationStatus.HELD
         item.breach_reason = reason
         return item
 
