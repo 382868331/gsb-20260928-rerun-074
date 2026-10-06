@@ -69,6 +69,8 @@ class Scheduler:
         self.last_blockages: dict[str, str] = {}
         self.reservations = ReservationLedger()
         self._arrivals: set[tuple[str, int]] = set()
+        self._completion_notices: set[tuple[str, Optional[int]]] = set()
+        self._joint_plans: dict[str, dict] = {}
 
     # ---- 提交与容量校验 -------------------------------------------------
 
